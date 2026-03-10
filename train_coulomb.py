@@ -104,13 +104,14 @@ def evaluate(model, dataset, norm: Normaliser, device):
     return float(np.mean(errs))
 
 
-def run(model, train_data, test_data, norm, n_epochs, lr, device, label):
+def run(model, train_data, test_data, norm, n_epochs, lr, device, label,
+        weight_decay=0.0):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\n{'─'*58}")
     print(f"  {label}  ({n_params:,} params)")
     print(f"{'─'*58}")
 
-    opt  = torch.optim.Adam(model.parameters(), lr=lr)
+    opt  = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs, eta_min=lr / 20)
 
     t0 = time.time()
@@ -179,16 +180,18 @@ def main():
         label='KronHamModel (no e3nn, +Kronecker)',
     )
 
-    # 3. KronHamModelE3NN — equivariant backbone
+    # 3. KronHamModelE3NN — equivariant backbone (fixed)
     if HAS_E3NN_COULOMB:
         m3 = KronHamModelE3NN(
-            hidden=64, node_irreps='4x0e + 4x1o + 4x2e',
+            hidden=64,
+            node_irreps='4x0e + 4x1o + 4x2e',   # equal muls required by e3nn uvu
             edge_sh_lmax=2, n_layers=3,
             cutoff=CUTOFF, **kron_cfg,
         ).to(device)
         results['KronHamModelE3NN (e3nn, +Kronecker)'] = run(
             m3, train_data, test_data, norm, N_EPOCHS, LR, device,
             label='KronHamModelE3NN (e3nn backbone, +Kronecker)',
+            weight_decay=1e-4,   # regularise equivariant model to prevent overfitting
         )
     else:
         print("\n[skip] e3nn not installed — KronHamModelE3NN not tested")

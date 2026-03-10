@@ -443,17 +443,26 @@ try:
 
     class KronHamModelE3NN(nn.Module):
         """
-        e3nn equivariant backbone + KronHamCore.
+        e3nn equivariant backbone + KronHamCore.  (v2 — physically correct)
 
-        Fixes the input-feature mismatch that broke model_v2.py on the Coulomb task:
+        Two key fixes over the naive version:
+
+        Fix 1 — correct charge input:
           model_v2.py  → nn.Embedding(integer atom_type)  — no charge value
           This model   → nn.Linear(1, scalar_mul)          — continuous scalar charge
 
-        Architecture:
-          1. Embed scalar charges into the L=0 (scalar) irreps channel.
-          2. Run equivariant message passing (uses 3-D edge vectors → spherical harmonics).
-          3. Project full irreps features to plain-float hidden for KronHamCore.
-          4. E_total = E_local (per-atom sum from scalars) + E_kron (Kronecker energy).
+        Fix 2 — only scalar channels feed into scalar energy (rotation-invariant):
+          WRONG: project full irreps (L=0,1,2) → hidden → KronHamCore
+                 L=1 vectors and L=2 tensors are NOT invariant; feeding them
+                 into a scalar MLP violates equivariance and corrupts training.
+          RIGHT: extract only L=0 channels after MP → LayerNorm → KronHamCore
+                 L=1/L=2 are still used inside message passing for richer
+                 directional aggregation, but not for the final scalar output.
+
+        Note on e3nn uvu mode: all irreps must have equal multiplicity.
+        Default node_irreps "4x0e + 4x1o + 4x2e":  mul=4 everywhere (required).
+          scalar_mul = 4  (L=0 channels → energy)
+          L=1,2 mul=4 enrich MP via spherical-harmonic edge features.
 
         Same forward(charges, pos, subsystem_ids) API as LocalGNN / KronHamModel.
         """
@@ -461,7 +470,7 @@ try:
         def __init__(
             self,
             hidden:       int   = 64,
-            node_irreps:  str   = "4x0e + 4x1o + 4x2e",
+            node_irreps:  str   = "4x0e + 4x1o + 4x2e",  # equal muls required by uvu
             edge_sh_lmax: int   = 2,
             n_layers:     int   = 3,
             cutoff:       float = 4.0,
@@ -485,9 +494,14 @@ try:
                 for _ in range(n_layers)
             ])
 
-            # ── project full irreps dim → plain hidden for KronHamCore ──
+            # ── extract and normalise scalar channels only ──
+            # L=0 channels are rotation-invariant → safe for scalar energy
+            # LayerNorm fixes the scale explosion at init (loss 700 → ~3)
+            self.scalar_norm = nn.LayerNorm(self.scalar_mul)
+
+            # ── project scalar channels → plain hidden for KronHamCore ──
             self.to_hidden = nn.Sequential(
-                nn.Linear(node_ir.dim, hidden),
+                nn.Linear(self.scalar_mul, hidden),
                 nn.SiLU(),
             )
 
@@ -506,23 +520,26 @@ try:
             pos:           Tensor,   # [N, 3]
             subsystem_ids: Tensor,   # [N]
         ) -> Dict[str, Tensor]:
-            # Build edges with full 3-D vectors (for spherical harmonics)
+            # Build edges with full 3-D vectors (needed for spherical harmonics)
             edge_index, edge_vec = _e3nn_build_edges(pos, self.cutoff)
 
-            # Initialise node features: scalars from charges, higher-L = 0
+            # Initialise: scalar channels ← charges, L=1/L=2 ← 0
             h = torch.zeros(pos.shape[0], self.node_irreps_dim,
                             device=pos.device, dtype=pos.dtype)
             h[:, :self.scalar_mul] = self.charge_embed(charges.unsqueeze(-1))
 
-            # Equivariant message passing
+            # Equivariant message passing (L=1,2 help directional aggregation)
             for mp in self.mp_layers:
                 h = mp(h, edge_index, edge_vec)
 
-            # Local energy from rotation-invariant scalar channels
-            E_local = self.local_head(h[:, :self.scalar_mul]).sum()
+            # Extract ONLY scalar channels — rotation-invariant outputs
+            scalars = self.scalar_norm(h[:, :self.scalar_mul])  # [N, scalar_mul]
 
-            # Project to plain hidden → Kronecker core
-            h_hid = self.to_hidden(h)
+            # Local energy from scalar channels
+            E_local = self.local_head(scalars).sum()
+
+            # Project scalars → hidden → Kronecker core
+            h_hid = self.to_hidden(scalars)
             kron  = self.kron_core(h_hid, subsystem_ids)
 
             return {
