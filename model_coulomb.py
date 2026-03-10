@@ -437,9 +437,66 @@ class KronHamModel(nn.Module):
 # ══════════════════════════════════════════════════════════════
 
 try:
-    from e3nn.o3 import Irreps
-    from model_v2 import EquivariantMessagePassing
+    from e3nn.o3 import Irreps, TensorProduct, SphericalHarmonics, Linear as E3Linear
+    from e3nn.nn import FullyConnectedNet
     from model_v2 import build_edge_index as _e3nn_build_edges
+
+    class FlexEquivMP(nn.Module):
+        """
+        Equivariant message passing with 'uvw' TensorProduct mode.
+
+        Unlike model_v2.py's EquivariantMessagePassing (which uses 'uvu' and
+        requires all irreps to have equal multiplicity), 'uvw' allows ANY
+        combination of multiplicities — e.g. "16x0e + 4x1o + 2x2e".
+
+        'uvu' constraint:  mul_in1[L] == mul_out[L]  for every L  → all muls equal
+        'uvw' constraint:  none — full bilinear, weight_count per instruction
+                           = mul_in1 × mul_in2 × mul_out
+                           (mul_in2 = 1 always from spherical harmonics → manageable)
+
+        Use fc_hidden=[32,32] (smaller than model_v2's [64,64]) because uvw
+        produces more TP weights and we want to keep the fc MLP param count
+        similar.
+        """
+
+        def __init__(self, node_irreps: str, edge_sh_lmax: int = 2,
+                     fc_hidden: list = [32, 32]):
+            super().__init__()
+            self.node_irreps    = Irreps(node_irreps)
+            edge_sh_irreps      = Irreps.spherical_harmonics(edge_sh_lmax)
+            self.sh = SphericalHarmonics(edge_sh_irreps, normalize=True,
+                                         normalization='component')
+
+            # Build instructions using 'uvw' — no equal-mul constraint
+            instructions = []
+            for i, (mul_i, ir_i) in enumerate(self.node_irreps):
+                for j, (_, ir_j) in enumerate(edge_sh_irreps):
+                    for k, (mul_k, ir_k) in enumerate(self.node_irreps):
+                        if ir_k in ir_i * ir_j:
+                            instructions.append((i, j, k, 'uvw', True))
+
+            self.tp = TensorProduct(
+                self.node_irreps, edge_sh_irreps, self.node_irreps,
+                instructions=instructions,
+                shared_weights=False, internal_weights=False,
+            )
+            # fc: dist scalar → TP weights
+            self.fc = FullyConnectedNet(
+                [1] + fc_hidden + [self.tp.weight_numel],
+                act=F.silu,
+            )
+            self.linear = E3Linear(self.node_irreps, self.node_irreps)
+
+        def forward(self, node_feat: Tensor, edge_index: Tensor,
+                    edge_vec: Tensor) -> Tensor:
+            src, dst    = edge_index
+            edge_sh     = self.sh(edge_vec)
+            dist        = edge_vec.norm(dim=-1, keepdim=True)
+            tp_weights  = self.fc(dist)
+            msg         = self.tp(node_feat[src], edge_sh, tp_weights)
+            aggr        = torch.zeros_like(node_feat)
+            aggr.scatter_add_(0, dst.unsqueeze(-1).expand_as(msg), msg)
+            return self.linear(aggr) + node_feat   # residual
 
     class KronHamModelE3NN(nn.Module):
         """
@@ -455,16 +512,17 @@ try:
           WRONG (v1): project full irreps (L=0,1,2) → hidden  [violates equivariance]
           WRONG (v2): extract only L=0 scalars (4 dims)       [rank-4 bottleneck]
           RIGHT (v3): extract ALL invariant signatures:
-            • L=0 channels directly          (4 scalars)
-            • norms of L=1 vectors  |v|      (4 scalars — rotation-invariant)
-            • norms of L=2 tensors  |T|      (4 scalars — rotation-invariant)
-            → 12 invariant features per node
-          Vector/tensor norms are rotation-invariant (‖Rv‖ = ‖v‖) and carry
-          richer distance-directional information from the equivariant MP.
+            • L=0 channels directly          (scalar_mul scalars)
+            • norms of L=1 vectors  ‖v‖      (vec_mul  scalars — rotation-invariant)
+            • norms of L=2 tensors  ‖T‖      (tens_mul scalars — rotation-invariant)
+            → inv_dim = scalar_mul + vec_mul + tens_mul invariant features per node
 
-        Note on e3nn uvu mode: all irreps must have equal multiplicity.
-        Default node_irreps "4x0e + 4x1o + 4x2e":  mul=4 everywhere (required).
-          scalar_mul=4, vec_mul=4, tens_mul=4  → 12 combined invariant features.
+        Fix 3 — FlexEquivMP with 'uvw' mode (no equal-mul constraint):
+          'uvu' (model_v2.py): all muls must be equal → "4x0e + 4x1o + 4x2e" only
+          'uvw' (FlexEquivMP): arbitrary muls → "16x0e + 4x1o + 2x2e" allowed
+          This lets us use MANY scalar channels (16) for capacity while keeping
+          few directional channels (4 L=1, 2 L=2) for enriched MP without bloat.
+          inv_dim = 16 + 4 + 2 = 22  (vs 12 from equal-mul "4x0e+4x1o+4x2e")
 
         Same forward(charges, pos, subsystem_ids) API as LocalGNN / KronHamModel.
         """
@@ -472,7 +530,7 @@ try:
         def __init__(
             self,
             hidden:       int   = 64,
-            node_irreps:  str   = "4x0e + 4x1o + 4x2e",  # equal muls required by uvu
+            node_irreps:  str   = "16x0e + 4x1o + 2x2e",  # uvw allows mixed muls!
             edge_sh_lmax: int   = 2,
             n_layers:     int   = 3,
             cutoff:       float = 4.0,
@@ -498,9 +556,9 @@ try:
             # ── charge input: continuous scalar → L=0 irreps channel ──
             self.charge_embed = nn.Linear(1, self.scalar_mul)
 
-            # ── equivariant message passing ──
+            # ── equivariant message passing (uvw mode → mixed muls allowed) ──
             self.mp_layers = nn.ModuleList([
-                EquivariantMessagePassing(node_irreps, edge_sh_lmax)
+                FlexEquivMP(node_irreps, edge_sh_lmax, fc_hidden=[32, 32])
                 for _ in range(n_layers)
             ])
 
@@ -611,9 +669,10 @@ if __name__ == '__main__':
     out['energy'].backward()
     print(f"\nGradient flow: OK")
 
-    # KronHamModelE3NN
+    # KronHamModelE3NN  (mixed-mul config via uvw mode)
     if HAS_E3NN_COULOMB:
-        m_e3nn = KronHamModelE3NN(hidden=32, cutoff=4.0, basis_dim=4, K=4, k_states=8)
+        m_e3nn = KronHamModelE3NN(hidden=32, node_irreps='16x0e + 4x1o + 2x2e',
+                                   cutoff=4.0, basis_dim=4, K=4, k_states=8)
         out2 = m_e3nn(charges, pos, sids)
         print(f"\nKronHamModelE3NN energy: {out2['energy'].item():.4f}")
         print(f"  E_local: {out2['E_local'].item():.4f}")

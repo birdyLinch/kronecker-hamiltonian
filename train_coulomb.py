@@ -184,7 +184,7 @@ def main():
     if HAS_E3NN_COULOMB:
         m3 = KronHamModelE3NN(
             hidden=64,
-            node_irreps='4x0e + 4x1o + 4x2e',   # equal muls required by e3nn uvu
+            node_irreps='16x0e + 4x1o + 2x2e',  # uvw mode: mixed muls now allowed
             edge_sh_lmax=2, n_layers=3,
             cutoff=CUTOFF, **kron_cfg,
         ).to(device)
