@@ -1,25 +1,29 @@
 """
 train_coulomb.py
 ================
-Train and compare three models on the Coulomb long-range dataset:
+Train and compare three models on the long-range Coulomb dataset:
 
-  1. LocalGNN        — pure PyTorch MPNN, no e3nn, per-atom sum
-  2. KronHamModel    — pure PyTorch MPNN + Kronecker core, no e3nn
-  3. KronHamModelV2  — e3nn equivariant backbone + Kronecker core (model_v2.py)
+  1. LocalGNN          — scalar MPNN, per-atom sum       (no e3nn, no Kronecker)
+  2. KronHamModel      — scalar MPNN + Kronecker core    (no e3nn, +Kronecker)
+  3. KronHamModelE3NN  — equivariant MPNN + Kronecker    (e3nn backbone, +Kronecker)
 
-Key question: does using e3nn's equivariance help for this scalar task?
+All three share the same:
+  • forward(charges, pos, subsystem_ids) → {'energy': ...} API
+  • continuous scalar charge input: nn.Linear(1, ·) — NOT nn.Embedding(atom_type)
+  • KronHamCore (models 2 & 3 only)
+
+Key question: does e3nn's rotational equivariance help for this scalar task?
 
 Physics setup:
-  Two clusters A and B, separation=8 Å >> cutoff=4 Å.
-  E_total = E_AA + E_BB + E_AB (Coulomb, 1/r).
-  LocalGNN provably cannot learn E_AB (zero A-B edges).
-  Kronecker models implicitly capture E_AB via spectral cross-products.
+  Cluster A (5 atoms, σ=0.5 Å)  ←── 8 Å ───→  Cluster B (5 atoms, σ=0.5 Å)
+  GNN cutoff = 4 Å  →  ZERO A-B edges in any model.
+  E_total = E_AA + E_BB + E_AB   (1/r Coulomb, all atoms carry scalar charges)
 
 Expected outcome:
-  LocalGNN:      MAE ≈ std(E_AB)       [cannot fit long-range term]
-  KronHamModel:  MAE << std(E_AB)      [Kronecker spectral coupling helps]
-  KronHamV2:     similar to KronHamModel, possibly slightly better
-                 (e3nn gives orientation features, but Coulomb is scalar → limited gain)
+  LocalGNN:         MAE ≈ std(E_AB)        cannot learn long-range at all
+  KronHamModel:     MAE << std(E_AB)       Kronecker spectral coupling helps
+  KronHamModelE3NN: similar to KronHamModel  equivariance has limited benefit
+                    for a scalar energy task with isotropic (Gaussian) clusters
 """
 
 import time
@@ -27,19 +31,19 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-from model_coulomb import generate_dataset, LocalGNN, KronHamModel
+from model_coulomb import (
+    generate_dataset,
+    LocalGNN,
+    KronHamModel,
+    HAS_E3NN_COULOMB,
+)
 
-# ── optional e3nn model ──────────────────────────────────────
-try:
-    from model_v2 import KroneckerHamiltonianModelV2
-    HAS_E3NN = True
-except ImportError:
-    HAS_E3NN = False
-    print("[warn] e3nn not available — skipping KronHamModelV2")
+if HAS_E3NN_COULOMB:
+    from model_coulomb import KronHamModelE3NN
 
 
 # ══════════════════════════════════════════════════════════════
-# Dataset normalisation helper
+# Normaliser
 # ══════════════════════════════════════════════════════════════
 
 class Normaliser:
@@ -48,122 +52,77 @@ class Normaliser:
     def __init__(self, values: list):
         arr = np.array(values, dtype=np.float32)
         self.mean = float(arr.mean())
-        self.std  = float(arr.std()) or 1.0
+        self.std  = max(float(arr.std()), 1e-6)
 
-    def normalise(self, x: float) -> float:
+    def encode(self, x: float) -> float:
         return (x - self.mean) / self.std
 
-    def denormalise(self, x: float) -> float:
+    def decode(self, x: float) -> float:
         return x * self.std + self.mean
 
-    def denormalise_tensor(self, t: torch.Tensor) -> torch.Tensor:
-        return t * self.std + self.mean
-
 
 # ══════════════════════════════════════════════════════════════
-# Training loop
+# Training / evaluation
 # ══════════════════════════════════════════════════════════════
 
-def train_epoch(model, dataset, optimiser, norm: Normaliser, device, use_e3nn=False):
-    """One epoch: iterate every sample, accumulate gradients in mini-batches."""
+def train_epoch(model, dataset, optimiser, norm: Normaliser, device):
     model.train()
-    indices = torch.randperm(len(dataset)).tolist()
+    indices    = torch.randperm(len(dataset)).tolist()
     total_loss = 0.0
+    BATCH      = 32
 
-    BATCH = 32
     for start in range(0, len(dataset), BATCH):
-        batch = [dataset[i] for i in indices[start:start + BATCH]]
+        batch = [dataset[i] for i in indices[start: start + BATCH]]
         optimiser.zero_grad()
-        batch_loss = torch.tensor(0.0, device=device)
+        loss = torch.tensor(0.0, device=device)
 
-        for sample in batch:
-            charges = sample['charges'].to(device)
-            pos     = sample['pos'].to(device)
-            sids    = sample['subsystem_ids'].to(device)
-            target  = torch.tensor(
-                norm.normalise(sample['E_total'].item()),
-                dtype=torch.float32, device=device
-            )
+        for s in batch:
+            pred   = model(s['charges'].to(device),
+                           s['pos'].to(device),
+                           s['subsystem_ids'].to(device))['energy']
+            target = torch.tensor(norm.encode(s['E_total'].item()),
+                                  dtype=torch.float32, device=device)
+            loss   = loss + (pred - target) ** 2
 
-            if use_e3nn:
-                # KroneckerHamiltonianModelV2 needs atom_types (use subsystem_ids as proxy)
-                out = model(pos, sids.int(), sids)
-                pred = out['energy']
-            else:
-                out  = model(charges, pos, sids)
-                pred = out['energy']
-
-            batch_loss = batch_loss + (pred - target) ** 2
-
-        batch_loss = batch_loss / len(batch)
-        batch_loss.backward()
+        (loss / len(batch)).backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimiser.step()
-        total_loss += batch_loss.item()
+        total_loss += (loss / len(batch)).item()
 
     return total_loss / max(1, len(dataset) // BATCH)
 
 
 @torch.no_grad()
-def evaluate(model, dataset, norm: Normaliser, device, use_e3nn=False):
-    """Returns MAE on E_total (original scale) and array of E_AB truths."""
+def evaluate(model, dataset, norm: Normaliser, device):
     model.eval()
-    errs_total = []
-    e_ab_true  = []
-
-    for sample in dataset:
-        charges = sample['charges'].to(device)
-        pos     = sample['pos'].to(device)
-        sids    = sample['subsystem_ids'].to(device)
-
-        if use_e3nn:
-            out = model(pos, sids.int(), sids)
-        else:
-            out = model(charges, pos, sids)
-
-        pred_norm = out['energy'].item()
-        pred      = norm.denormalise(pred_norm)
-        true      = sample['E_total'].item()
-
-        errs_total.append(abs(pred - true))
-        e_ab_true.append(sample['E_AB'].item())
-
-    return float(np.mean(errs_total)), np.array(e_ab_true)
+    errs = []
+    for s in dataset:
+        pred = model(s['charges'].to(device),
+                     s['pos'].to(device),
+                     s['subsystem_ids'].to(device))['energy'].item()
+        errs.append(abs(norm.decode(pred) - s['E_total'].item()))
+    return float(np.mean(errs))
 
 
-def train_model(
-    model,
-    train_data, test_data,
-    norm: Normaliser,
-    n_epochs:   int   = 100,
-    lr:         float = 3e-3,
-    device:     str   = 'cpu',
-    label:      str   = 'Model',
-    use_e3nn:   bool  = False,
-):
+def run(model, train_data, test_data, norm, n_epochs, lr, device, label):
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"\n{'─'*55}")
+    print(f"\n{'─'*58}")
     print(f"  {label}  ({n_params:,} params)")
-    print(f"{'─'*55}")
+    print(f"{'─'*58}")
 
-    optimiser = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimiser, T_max=n_epochs, eta_min=lr / 20
-    )
+    opt  = torch.optim.Adam(model.parameters(), lr=lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs, eta_min=lr / 20)
 
     t0 = time.time()
-    for epoch in range(1, n_epochs + 1):
-        loss = train_epoch(model, train_data, optimiser, norm, device, use_e3nn)
-        scheduler.step()
+    for ep in range(1, n_epochs + 1):
+        loss = train_epoch(model, train_data, opt, norm, device)
+        sched.step()
+        if ep % (n_epochs // 5) == 0 or ep == 1:
+            mae = evaluate(model, test_data, norm, device)
+            print(f"  epoch {ep:3d}/{n_epochs}  loss={loss:.4f}  "
+                  f"test_MAE={mae:.4f}  ({time.time()-t0:.0f}s)")
 
-        if epoch % (n_epochs // 5) == 0 or epoch == 1:
-            mae, _ = evaluate(model, test_data, norm, device, use_e3nn)
-            elapsed = time.time() - t0
-            print(f"  epoch {epoch:3d}/{n_epochs}  loss={loss:.4f}  "
-                  f"test_MAE={mae:.4f}  ({elapsed:.0f}s)")
-
-    final_mae, e_ab = evaluate(model, test_data, norm, device, use_e3nn)
-    return final_mae, e_ab
+    return evaluate(model, test_data, norm, device)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -174,116 +133,99 @@ def main():
     torch.manual_seed(42)
     device = 'cpu'
 
-    # ── Dataset config ───────────────────────────────────────
-    N_A, N_B      = 5, 5
-    SEPARATION    = 8.0    # Å — far beyond GNN cutoff
-    CLUSTER_STD   = 0.5   # Å — tight clusters, all intra-pairs within cutoff
-    CUTOFF        = 4.0   # Å — no A-B edges when separation >> cutoff
-    CHARGE_SCALE  = 1.0
+    # ── dataset ─────────────────────────────────────────────
+    N_A, N_B     = 5, 5
+    SEPARATION   = 8.0    # Å  >> cutoff → zero A-B edges
+    CLUSTER_STD  = 0.5    # Å  tight clusters, all intra pairs within cutoff
+    CUTOFF       = 4.0    # Å
+    CHARGE_SCALE = 1.0
+    N_EPOCHS     = 100
+    LR           = 3e-3
 
-    print("=" * 55)
-    print(" Kronecker Hamiltonian — Long-Range Coulomb Demo")
-    print("=" * 55)
-    print(f"\nDataset: n_A={N_A}, n_B={N_B}, sep={SEPARATION}Å, cutoff={CUTOFF}Å")
+    print("=" * 58)
+    print(" Kronecker Hamiltonian — Long-Range Coulomb Experiment")
+    print("=" * 58)
+    print(f"\nGeometry: n_A={N_A}, n_B={N_B}, sep={SEPARATION} Å, cutoff={CUTOFF} Å")
     print("Generating dataset …")
 
     train_data = generate_dataset(1000, N_A, N_B, SEPARATION, CLUSTER_STD, CHARGE_SCALE, seed=0)
     test_data  = generate_dataset(200,  N_A, N_B, SEPARATION, CLUSTER_STD, CHARGE_SCALE, seed=1000)
 
-    # Statistics
     e_totals = [s['E_total'].item() for s in train_data]
-    e_locals = [s['E_local'].item() for s in train_data]
     e_abs    = [s['E_AB'].item()    for s in train_data]
+    norm     = Normaliser(e_totals)
 
-    norm = Normaliser(e_totals)   # fit normaliser on training set
+    print(f"\nDataset statistics (train, N={len(train_data)}):")
+    print(f"  E_total : std = {np.std(e_totals):.3f}")
+    print(f"  E_AB    : std = {np.std(e_abs):.3f}  ← LocalGNN irreducible error floor")
 
-    print(f"\nTraining set statistics:")
-    print(f"  E_total : mean={np.mean(e_totals):+.3f}  std={np.std(e_totals):.3f}")
-    print(f"  E_local : mean={np.mean(e_locals):+.3f}  std={np.std(e_locals):.3f}")
-    print(f"  E_AB    : mean={np.mean(e_abs):+.3f}  std={np.std(e_abs):.3f}")
-    print(f"\n  LocalGNN lower-bound MAE ≈ std(E_AB) = {np.std(e_abs):.3f}")
-    print(f"  (because LocalGNN cannot predict E_AB at all — zero A-B edges)")
-
-    # ── Shared hyper-params ──────────────────────────────────
-    N_EPOCHS = 100
-    LR       = 3e-3
-    common   = dict(hidden=64, n_rbf=20, cutoff=CUTOFF, n_layers=3)
+    # ── shared backbone config ───────────────────────────────
+    scalar_cfg = dict(hidden=64, n_rbf=20, cutoff=CUTOFF, n_layers=3)
+    kron_cfg   = dict(basis_dim=4, K=4, k_states=8)
 
     results = {}
 
-    # ── 1. LocalGNN ──────────────────────────────────────────
-    model_local = LocalGNN(**common).to(device)
-    mae_local, e_ab_test = train_model(
-        model_local, train_data, test_data, norm,
-        N_EPOCHS, LR, device, label='LocalGNN (no e3nn, no Kronecker)',
+    # 1. LocalGNN
+    m1 = LocalGNN(**scalar_cfg).to(device)
+    results['LocalGNN (no e3nn, no Kronecker)'] = run(
+        m1, train_data, test_data, norm, N_EPOCHS, LR, device,
+        label='LocalGNN (no e3nn, no Kronecker)',
     )
-    results['LocalGNN'] = mae_local
 
-    # ── 2. KronHamModel (pure PyTorch) ───────────────────────
-    model_kron = KronHamModel(**common, basis_dim=4, K=4, k_states=8).to(device)
-    mae_kron, _ = train_model(
-        model_kron, train_data, test_data, norm,
-        N_EPOCHS, LR, device, label='KronHamModel (no e3nn, +Kronecker)',
+    # 2. KronHamModel — pure PyTorch
+    m2 = KronHamModel(**scalar_cfg, **kron_cfg).to(device)
+    results['KronHamModel (no e3nn, +Kronecker)'] = run(
+        m2, train_data, test_data, norm, N_EPOCHS, LR, device,
+        label='KronHamModel (no e3nn, +Kronecker)',
     )
-    results['KronHamModel'] = mae_kron
 
-    # ── 3. KronHamModelV2 with e3nn backbone ─────────────────
-    if HAS_E3NN:
-        e3nn_config = {
-            'atom_types':     2,       # we use subsystem_id (0 or 1) as atom type
-            'atom_embed_dim': 32,
-            'node_irreps':    '4x0e + 4x1o + 4x2e',  # equal muls for uvu mode
-            'edge_sh_lmax':   2,
-            'n_mp_layers':    3,
-            'K':              4,
-            'vector_irreps':  '1x0e + 1x1o',           # basis_dim = 4
-            'basis_dim':      4,
-            'k_keep':         32,
-            'k_states':       8,
-            'cutoff':         CUTOFF,
-        }
-        model_e3nn = KroneckerHamiltonianModelV2(e3nn_config).to(device)
-        mae_e3nn, _ = train_model(
-            model_e3nn, train_data, test_data, norm,
-            N_EPOCHS, LR, device,
-            label='KronHamModelV2 (e3nn backbone, +Kronecker)',
-            use_e3nn=True,
+    # 3. KronHamModelE3NN — equivariant backbone
+    if HAS_E3NN_COULOMB:
+        m3 = KronHamModelE3NN(
+            hidden=64, node_irreps='4x0e + 4x1o + 4x2e',
+            edge_sh_lmax=2, n_layers=3,
+            cutoff=CUTOFF, **kron_cfg,
+        ).to(device)
+        results['KronHamModelE3NN (e3nn, +Kronecker)'] = run(
+            m3, train_data, test_data, norm, N_EPOCHS, LR, device,
+            label='KronHamModelE3NN (e3nn backbone, +Kronecker)',
         )
-        results['KronHamV2 (e3nn)'] = mae_e3nn
-
-    # ── Summary ──────────────────────────────────────────────
-    std_e_ab = np.std([s['E_AB'].item() for s in test_data])
-
-    print(f"\n{'='*55}")
-    print(" Results Summary")
-    print(f"{'='*55}")
-    print(f"  std(E_AB) on test = {std_e_ab:.4f}  ← LocalGNN floor")
-    print()
-    print(f"  {'Model':<35} {'MAE':>8}  {'vs LocalGNN':>12}")
-    print(f"  {'-'*56}")
-    mae_local_v = results['LocalGNN']
-    for name, mae in results.items():
-        ratio = f"{mae_local_v / mae:.1f}x better" if mae < mae_local_v else "—"
-        print(f"  {name:<35} {mae:>8.4f}  {ratio:>12}")
-
-    print()
-    print("Interpretation:")
-    if results.get('KronHamModel', 1e9) < mae_local_v * 0.8:
-        print("  ✓ KronHamModel significantly outperforms LocalGNN")
-        print("  ✓ Kronecker spectral coupling captures long-range E_AB")
     else:
-        print("  → Increase n_epochs or check if E_AB signal is large enough")
+        print("\n[skip] e3nn not installed — KronHamModelE3NN not tested")
 
-    if HAS_E3NN and 'KronHamV2 (e3nn)' in results:
-        diff = abs(results['KronHamV2 (e3nn)'] - results['KronHamModel'])
-        if diff < 0.01 * std_e_ab * 10:
-            print("  ≈ e3nn backbone gives similar MAE to plain PyTorch backbone")
-            print("    (expected: Coulomb energy is scalar — orientational equivariance")
-            print("     doesn't help beyond what distance features already capture)")
-        elif results['KronHamV2 (e3nn)'] < results['KronHamModel']:
-            print("  ✓ e3nn backbone improves over plain PyTorch backbone")
+    # ── summary ──────────────────────────────────────────────
+    std_e_ab  = float(np.std([s['E_AB'].item() for s in test_data]))
+    mae_local = results['LocalGNN (no e3nn, no Kronecker)']
+
+    print(f"\n{'='*58}")
+    print(" Results Summary")
+    print(f"{'='*58}")
+    print(f"  std(E_AB) test = {std_e_ab:.4f}  ← LocalGNN cannot beat this\n")
+    print(f"  {'Model':<42} {'MAE':>7}  {'vs LocalGNN':>11}")
+    print(f"  {'-'*62}")
+    for name, mae in results.items():
+        vs = f"{mae_local/mae:.1f}x better" if mae < mae_local else "—"
+        print(f"  {name:<42} {mae:>7.4f}  {vs:>11}")
+
+    print()
+    # Kronecker gain
+    mae_kron = results.get('KronHamModel (no e3nn, +Kronecker)', None)
+    if mae_kron and mae_kron < mae_local * 0.80:
+        print("✓ Kronecker spectral coupling captures long-range E_AB")
+
+    # e3nn vs pure-PyTorch comparison
+    mae_e3nn = results.get('KronHamModelE3NN (e3nn, +Kronecker)', None)
+    if mae_e3nn is not None and mae_kron is not None:
+        ratio = mae_kron / mae_e3nn
+        if   ratio > 1.15:
+            verdict = "✓ e3nn backbone is better  (orientation info helps)"
+        elif ratio < 0.85:
+            verdict = "≈ e3nn backbone is WORSE  (overhead > benefit for scalar task)"
         else:
-            print("  ✗ e3nn backbone did not help — scalar task, extra symmetry unused")
+            verdict = "≈ e3nn and plain PyTorch are similar  (equivariance not decisive)"
+        print(f"{verdict}")
+        print("  (expected: Coulomb energy is scalar/isotropic → equivariance"
+              " less critical than for tensor properties like forces / polarisability)")
 
 
 if __name__ == '__main__':

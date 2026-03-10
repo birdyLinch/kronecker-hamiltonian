@@ -1,14 +1,13 @@
 """
 model_coulomb.py
 ================
-Pure PyTorch (no e3nn) Coulomb interaction demo for Kronecker Hamiltonian.
-
-Demonstrates that the Kronecker structure can capture long-range A-B interactions
-that a standard local GNN cannot (due to cutoff barrier).
+Coulomb interaction demo for Kronecker Hamiltonian.
+Includes both pure PyTorch and e3nn backbone variants.
 
 Architecture:
-  LocalGNN     — MPNN backbone + per-atom energy sum  (baseline, blind to long-range)
-  KronHamModel — MPNN backbone + KronHamCore          (captures E_AB via spectra)
+  LocalGNN         — scalar MPNN + per-atom sum          (baseline, blind to long-range)
+  KronHamModel     — scalar MPNN + KronHamCore           (no e3nn)
+  KronHamModelE3NN — equivariant MPNN + KronHamCore     (e3nn backbone, fair comparison)
 
 Dataset:
   Two atomic clusters A and B, separated by >> cutoff.
@@ -433,6 +432,112 @@ class KronHamModel(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
+# KronHamModelE3NN — e3nn equivariant backbone + KronHamCore
+# (fair comparison: same charge input API as the pure-PyTorch models)
+# ══════════════════════════════════════════════════════════════
+
+try:
+    from e3nn.o3 import Irreps
+    from model_v2 import EquivariantMessagePassing
+    from model_v2 import build_edge_index as _e3nn_build_edges
+
+    class KronHamModelE3NN(nn.Module):
+        """
+        e3nn equivariant backbone + KronHamCore.
+
+        Fixes the input-feature mismatch that broke model_v2.py on the Coulomb task:
+          model_v2.py  → nn.Embedding(integer atom_type)  — no charge value
+          This model   → nn.Linear(1, scalar_mul)          — continuous scalar charge
+
+        Architecture:
+          1. Embed scalar charges into the L=0 (scalar) irreps channel.
+          2. Run equivariant message passing (uses 3-D edge vectors → spherical harmonics).
+          3. Project full irreps features to plain-float hidden for KronHamCore.
+          4. E_total = E_local (per-atom sum from scalars) + E_kron (Kronecker energy).
+
+        Same forward(charges, pos, subsystem_ids) API as LocalGNN / KronHamModel.
+        """
+
+        def __init__(
+            self,
+            hidden:       int   = 64,
+            node_irreps:  str   = "4x0e + 4x1o + 4x2e",
+            edge_sh_lmax: int   = 2,
+            n_layers:     int   = 3,
+            cutoff:       float = 4.0,
+            basis_dim:    int   = 4,
+            K:            int   = 4,
+            k_states:     int   = 8,
+        ):
+            super().__init__()
+            self.cutoff = cutoff
+
+            node_ir = Irreps(node_irreps)
+            self.scalar_mul      = sum(mul for mul, ir in node_ir if ir.l == 0)
+            self.node_irreps_dim = node_ir.dim
+
+            # ── charge input: continuous scalar → L=0 irreps channel ──
+            self.charge_embed = nn.Linear(1, self.scalar_mul)
+
+            # ── equivariant message passing ──
+            self.mp_layers = nn.ModuleList([
+                EquivariantMessagePassing(node_irreps, edge_sh_lmax)
+                for _ in range(n_layers)
+            ])
+
+            # ── project full irreps dim → plain hidden for KronHamCore ──
+            self.to_hidden = nn.Sequential(
+                nn.Linear(node_ir.dim, hidden),
+                nn.SiLU(),
+            )
+
+            # ── local energy head (scalars only — rotation-invariant) ──
+            self.local_head = nn.Sequential(
+                nn.Linear(self.scalar_mul, hidden // 2), nn.SiLU(),
+                nn.Linear(hidden // 2, 1),
+            )
+
+            # ── Kronecker core (identical to KronHamModel) ──
+            self.kron_core = KronHamCore(hidden, basis_dim, K, k_states)
+
+        def forward(
+            self,
+            charges:       Tensor,   # [N]  continuous scalar charges
+            pos:           Tensor,   # [N, 3]
+            subsystem_ids: Tensor,   # [N]
+        ) -> Dict[str, Tensor]:
+            # Build edges with full 3-D vectors (for spherical harmonics)
+            edge_index, edge_vec = _e3nn_build_edges(pos, self.cutoff)
+
+            # Initialise node features: scalars from charges, higher-L = 0
+            h = torch.zeros(pos.shape[0], self.node_irreps_dim,
+                            device=pos.device, dtype=pos.dtype)
+            h[:, :self.scalar_mul] = self.charge_embed(charges.unsqueeze(-1))
+
+            # Equivariant message passing
+            for mp in self.mp_layers:
+                h = mp(h, edge_index, edge_vec)
+
+            # Local energy from rotation-invariant scalar channels
+            E_local = self.local_head(h[:, :self.scalar_mul]).sum()
+
+            # Project to plain hidden → Kronecker core
+            h_hid = self.to_hidden(h)
+            kron  = self.kron_core(h_hid, subsystem_ids)
+
+            return {
+                'energy':  E_local + kron['E_kron'],
+                'E_local': E_local,
+                **kron,
+            }
+
+    HAS_E3NN_COULOMB = True
+
+except ImportError:
+    HAS_E3NN_COULOMB = False
+
+
+# ══════════════════════════════════════════════════════════════
 # Quick sanity check
 # ══════════════════════════════════════════════════════════════
 
@@ -467,3 +572,14 @@ if __name__ == '__main__':
     # Gradient check
     out['energy'].backward()
     print(f"\nGradient flow: OK")
+
+    # KronHamModelE3NN
+    if HAS_E3NN_COULOMB:
+        m_e3nn = KronHamModelE3NN(hidden=32, cutoff=4.0, basis_dim=4, K=4, k_states=8)
+        out2 = m_e3nn(charges, pos, sids)
+        print(f"\nKronHamModelE3NN energy: {out2['energy'].item():.4f}")
+        print(f"  E_local: {out2['E_local'].item():.4f}")
+        print(f"  E_kron:  {out2['E_kron'].item():.4f}")
+        print(f"Params: {sum(p.numel() for p in m_e3nn.parameters()):,}")
+        out2['energy'].backward()
+        print(f"Gradient flow: OK")
