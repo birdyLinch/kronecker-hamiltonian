@@ -191,7 +191,6 @@ def main():
         results['KronHamModelE3NN (e3nn, +Kronecker)'] = run(
             m3, train_data, test_data, norm, N_EPOCHS, LR, device,
             label='KronHamModelE3NN (e3nn backbone, +Kronecker)',
-            weight_decay=1e-4,   # regularise equivariant model to prevent overfitting
         )
     else:
         print("\n[skip] e3nn not installed — KronHamModelE3NN not tested")

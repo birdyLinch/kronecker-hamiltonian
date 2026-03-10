@@ -451,18 +451,20 @@ try:
           model_v2.py  → nn.Embedding(integer atom_type)  — no charge value
           This model   → nn.Linear(1, scalar_mul)          — continuous scalar charge
 
-        Fix 2 — only scalar channels feed into scalar energy (rotation-invariant):
-          WRONG: project full irreps (L=0,1,2) → hidden → KronHamCore
-                 L=1 vectors and L=2 tensors are NOT invariant; feeding them
-                 into a scalar MLP violates equivariance and corrupts training.
-          RIGHT: extract only L=0 channels after MP → LayerNorm → KronHamCore
-                 L=1/L=2 are still used inside message passing for richer
-                 directional aggregation, but not for the final scalar output.
+        Fix 2 — invariant feature extraction from equivariant outputs:
+          WRONG (v1): project full irreps (L=0,1,2) → hidden  [violates equivariance]
+          WRONG (v2): extract only L=0 scalars (4 dims)       [rank-4 bottleneck]
+          RIGHT (v3): extract ALL invariant signatures:
+            • L=0 channels directly          (4 scalars)
+            • norms of L=1 vectors  |v|      (4 scalars — rotation-invariant)
+            • norms of L=2 tensors  |T|      (4 scalars — rotation-invariant)
+            → 12 invariant features per node
+          Vector/tensor norms are rotation-invariant (‖Rv‖ = ‖v‖) and carry
+          richer distance-directional information from the equivariant MP.
 
         Note on e3nn uvu mode: all irreps must have equal multiplicity.
         Default node_irreps "4x0e + 4x1o + 4x2e":  mul=4 everywhere (required).
-          scalar_mul = 4  (L=0 channels → energy)
-          L=1,2 mul=4 enrich MP via spherical-harmonic edge features.
+          scalar_mul=4, vec_mul=4, tens_mul=4  → 12 combined invariant features.
 
         Same forward(charges, pos, subsystem_ids) API as LocalGNN / KronHamModel.
         """
@@ -482,8 +484,16 @@ try:
             self.cutoff = cutoff
 
             node_ir = Irreps(node_irreps)
-            self.scalar_mul      = sum(mul for mul, ir in node_ir if ir.l == 0)
+            # Track per-L channel counts for invariant extraction
+            self.scalar_mul  = sum(mul for mul, ir in node_ir if ir.l == 0)
+            self.vec_mul     = sum(mul for mul, ir in node_ir if ir.l == 1)
+            self.tens_mul    = sum(mul for mul, ir in node_ir if ir.l == 2)
             self.node_irreps_dim = node_ir.dim
+            # Layout in h: [L=0 (scalar_mul), L=1 (vec_mul*3), L=2 (tens_mul*5)]
+            self.vec_offset  = self.scalar_mul
+            self.tens_offset = self.scalar_mul + self.vec_mul * 3
+            # Total invariant features: L0 scalars + L1 norms + L2 norms
+            self.inv_dim = self.scalar_mul + self.vec_mul + self.tens_mul
 
             # ── charge input: continuous scalar → L=0 irreps channel ──
             self.charge_embed = nn.Linear(1, self.scalar_mul)
@@ -494,20 +504,19 @@ try:
                 for _ in range(n_layers)
             ])
 
-            # ── extract and normalise scalar channels only ──
-            # L=0 channels are rotation-invariant → safe for scalar energy
-            # LayerNorm fixes the scale explosion at init (loss 700 → ~3)
-            self.scalar_norm = nn.LayerNorm(self.scalar_mul)
+            # ── normalise all invariant features ──
+            # LayerNorm on 12 invariant features (not just 4) fixes scale explosion
+            self.inv_norm = nn.LayerNorm(self.inv_dim)
 
-            # ── project scalar channels → plain hidden for KronHamCore ──
+            # ── project 12 invariant features → hidden (deeper to break rank bottleneck) ──
             self.to_hidden = nn.Sequential(
-                nn.Linear(self.scalar_mul, hidden),
-                nn.SiLU(),
+                nn.Linear(self.inv_dim, hidden), nn.SiLU(),
+                nn.Linear(hidden, hidden),       nn.SiLU(),
             )
 
-            # ── local energy head (scalars only — rotation-invariant) ──
+            # ── local energy head ──
             self.local_head = nn.Sequential(
-                nn.Linear(self.scalar_mul, hidden // 2), nn.SiLU(),
+                nn.Linear(self.inv_dim, hidden // 2), nn.SiLU(),
                 nn.Linear(hidden // 2, 1),
             )
 
@@ -532,14 +541,26 @@ try:
             for mp in self.mp_layers:
                 h = mp(h, edge_index, edge_vec)
 
-            # Extract ONLY scalar channels — rotation-invariant outputs
-            scalars = self.scalar_norm(h[:, :self.scalar_mul])  # [N, scalar_mul]
+            # ── Extract ALL rotation-invariant signatures ──────────────────
+            # L=0: scalars (directly invariant)
+            h_L0  = h[:, :self.vec_offset]                          # [N, 4]
+            # L=1: vectors → norms  (‖Rv‖ = ‖v‖ → rotation-invariant)
+            h_L1  = h[:, self.vec_offset:self.tens_offset]          # [N, 4*3]
+            norm_L1 = h_L1.reshape(-1, self.vec_mul, 3).norm(dim=-1)  # [N, 4]
+            # L=2: tensors → norms  (also rotation-invariant)
+            h_L2  = h[:, self.tens_offset:]                          # [N, 4*5]
+            norm_L2 = h_L2.reshape(-1, self.tens_mul, 5).norm(dim=-1) # [N, 4]
 
-            # Local energy from scalar channels
-            E_local = self.local_head(scalars).sum()
+            # Concatenate → 12 invariant features, then normalise
+            inv = self.inv_norm(
+                torch.cat([h_L0, norm_L1, norm_L2], dim=-1)         # [N, 12]
+            )
 
-            # Project scalars → hidden → Kronecker core
-            h_hid = self.to_hidden(scalars)
+            # Local energy from invariant features
+            E_local = self.local_head(inv).sum()
+
+            # Project 12 invariant → hidden (2-layer to break rank bottleneck)
+            h_hid = self.to_hidden(inv)                              # [N, 64]
             kron  = self.kron_core(h_hid, subsystem_ids)
 
             return {
