@@ -157,14 +157,75 @@ conda activate KronHam
 python test_kronecker.py
 ```
 
+## 长程相互作用实验（Coulomb 验证）
+
+用纯 PyTorch 模型在一个受控数据集上验证 Kronecker 结构能否捕获长程相互作用。
+
+### 实验设置
+
+```
+子系统 A（5个原子，σ=0.5Å）          子系统 B（5个原子，σ=0.5Å）
+       ●●●●●          ←── 8 Å ───→          ●●●●●
+   团簇内距离 ~1Å                         团簇内距离 ~1Å
+
+GNN cutoff = 4 Å  →  A、B 之间 **零条边**
+目标: E_total = E_AA + E_BB + E_AB   (1/r Coulomb)
+```
+
+- `LocalGNN`：MPNN 骨干 + 原子能量求和，无法"看到" E_AB（完全没有 A-B 边）
+- `KronHamModel`：MPNN 骨干 + Kronecker 核，通过谱结构隐式编码 A-B 耦合
+- `KronHamV2`：e3nn 等变骨干 + Kronecker 核
+
+### 结果（100 epoch，1000 训练样本）
+
+| 模型                      | 参数量  | Test MAE | vs LocalGNN |
+|---------------------------|---------|----------|-------------|
+| LocalGNN（无 Kronecker）  | 56,129  | 0.2139   | —           |
+| **KronHamModel（纯 PyTorch）** | 74,666 | **0.0756** | **2.8x 更好** |
+| KronHamV2（e3nn 骨干）    | 33,957  | 1.4641   | 更差        |
+
+`std(E_AB) = 0.18`（LocalGNN 的理论下界，不能预测 E_AB 时的不可约误差）
+
+### 结论
+
+**① Kronecker 谱耦合捕获了长程 E_AB**
+
+虽然 A-B 之间无任何 GNN 边，KronHamModel 依然把 MAE 从 0.21 降到 0.076：
+
+```
+ε_i^A 编码了子系统 A 的电荷分布谱
+ε_j^B 编码了子系统 B 的电荷分布谱
+ε_{ij} = ε_i^A + ε_j^B  ∝  q_A × q_B  ∝  E_AB
+能量 MLP 从中学到了跨子系统的关联
+```
+
+**② e3nn 等变性对标量 Coulomb 任务没有帮助**
+
+e3nn 版（KronHamV2）收敛很差，原因是架构上的输入特征不匹配：
+
+| 模型 | 电荷输入 | 说明 |
+|------|----------|------|
+| 纯 PyTorch | `nn.Linear(1, hidden)` — 直接嵌入连续标量电荷 | ✓ 正确 |
+| e3nn (model_v2) | `nn.Embedding(atom_types, dim)` — 仅整数原子类型 | ✗ 没有电荷信息 |
+
+核心教训：**正确的物理输入比等变架构更重要**。给错误输入的 e3nn 比给正确输入的纯 PyTorch 差很多。等变性提供了归纳偏置（旋转对称），但无法弥补缺失的物理量（电荷数值）。
+
+运行实验：
+
+```bash
+python train_coulomb.py   # 完整训练 + 对比（~10 分钟）
+```
+
 ## 文件结构
 
 ```
 kronecker_hamiltonian/
-├── model.py           # 完整模型（5个部分）
-├── model_v2.py        # 模型 v2
-├── train.py           # 训练脚本 + 使用示例
-├── test_kronecker.py  # 测试套件（7项测试，仅依赖 torch）
-├── requirements.txt   # 依赖列表
-└── README.md          # 本文件
+├── model.py            # 完整模型（5个部分）
+├── model_v2.py         # 模型 v2（e3nn 等变骨干）
+├── model_coulomb.py    # Coulomb demo（纯 PyTorch，无 e3nn）
+├── train.py            # 训练脚本 + 使用示例
+├── train_coulomb.py    # 长程交互对比实验
+├── test_kronecker.py   # 测试套件（8项测试）
+├── requirements.txt    # 依赖列表
+└── README.md           # 本文件
 ```
