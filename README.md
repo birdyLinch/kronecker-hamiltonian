@@ -413,36 +413,154 @@ This asymmetry reveals that model capacity determines whether perturb matters:
 weak model (e3nn L=0) → immune to memorisation → perturb irrelevant.
 Strong model (ScalarMPNN) → can memorise → perturb must stay small.
 
-### Open question: persistent 3× gap between e3nn L=0 and scalar
+### Closing the e3nn gap: self-interaction + channel width + MACE-style fc + EMA
+
+A systematic ablation revealing and addressing the three root causes of the 3× gap.
+
+#### Step 1 — Nonlinearity: self-interaction ablation (16x0e, uvw)
+
+Added `self_interaction` parameter to `FlexEquivMP`:
+
+| Variant | Self-interaction | MAE | Δ vs linear |
+|---------|-----------------|-----|------------|
+| `none` | `h ← Linear(aggr) + h` (linear only) | 0.1364 | — |
+| `nequip` | `h_L0 ← SiLU(Linear(h_L0_combined))` | 0.1239 | −9% |
+| `scalar_mix` | `h_L0 ← h_L0 + MLP(cat(h_self, h_aggr))` | 0.1208 | −11% |
+
+**Finding:** nonlinearity helps ~10%, but the gap to scalar (0.046) remains 2.6×.
+Conclusion: nonlinearity is not the bottleneck alone.
+
+#### Step 2 — Channel width: 64x0e + uvu
+
+The real bottleneck: during 3 MP layers, ScalarMPNN uses 64 hidden dims while
+FlexEquivMP uses only 16. Moving to 64x0e requires switching TP mode:
+
+| TP mode | Weight count | Constraint |
+|---------|-------------|-----------|
+| `uvw` | mul_in × mul_out = 64² = 4096 | None (too expensive) |
+| `uvu` | mul_in = 64 | mul_in == mul_out (per-channel gate) |
+
+`uvu` for L=0 reduces to per-channel gating (`out[u] = w_u(r) × h[u]`) —
+architecturally identical to the scalar model's `gate ⊙ h_j`, but with unconstrained `w`.
+
+| Model | ep80 MAE | ep100 MAE | Overfit? |
+|-------|----------|-----------|---------|
+| 16x0e ScalarMix | 0.121 | 0.121 | no |
+| 64x0e uvu ScalarMix (no fixes) | **0.083** | 0.113 | **yes** |
+
+64x0e hits 0.083 at ep80 (2× gap, down from 3×), but then overfits. Train loss
+collapses to 0.0002 while test MAE rises.
+
+#### Step 3 — MACE-style fc: LayerNorm inside radial MLP
+
+Root cause of overfitting: the TP weight predictor (`fc`) uses `Linear → SiLU` without
+normalization. As channel width grows (16→64), the TP weight scale becomes
+poorly conditioned, causing the bilinear coupling to blow up.
+
+**Fix (from MACE `RadialMLP`):** `Linear → LayerNorm → SiLU` per hidden layer.
+
+```python
+# Before (FullyConnectedNet from e3nn)
+fc = Linear(20,32) → SiLU → Linear(32,32) → SiLU → Linear(32, weight_numel)
+
+# After (MACE-style)
+fc = Linear(20,32) → LayerNorm(32) → SiLU → Linear(32,32) → LayerNorm(32) → SiLU → Linear(32, weight_numel)
+```
+
+| Model | ep80 MAE | ep100 MAE | train@100 | Overfit? |
+|-------|----------|-----------|-----------|---------|
+| no LayerNorm | 0.083 | 0.113 | 0.0002 | yes |
+| + LayerNorm | 0.102 | **0.092** | 0.0003 | no |
+
+LayerNorm fixes overfitting but convergence is slower (0.092 vs 0.083 best).
+
+#### Step 4 — EMA: Exponential Moving Average of weights (MACE/NequIP style)
+
+Standard in MACE and NequIP: maintain a shadow EMA copy of model weights
+(`ema_w ← 0.99 × ema_w + 0.01 × w`) and evaluate on those averaged weights.
+EMA smooths over the co-adaptation transients in the bilinear TP coupling.
+
+```python
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(0.99))
+# after each step: ema_model.update_parameters(model)
+# evaluate on: ema_model
+```
+
+| Model | ep80 | ep100 | train@100 |
+|-------|------|-------|-----------|
+| + LayerNorm, no EMA | 0.102 | 0.092 | 0.0003 |
+| + LayerNorm + EMA | 0.097 | **0.085** | 0.0011 |
+
+EMA improves ep100 by 8% and the model is **still converging** at ep100 (not plateaued).
+
+#### Current best results (100 epochs, 1000 training samples)
+
+| Model | Params | MAE | vs LocalGNN |
+|-------|--------|-----|------------|
+| LocalGNN (no Kronecker) | 56,129 | 0.1859 | — |
+| **KronHamModel (scalar + Kronecker)** | **74,666** | **0.0459** | **4.1×** |
+| e3nn 16x0e, linear | 54,762 | 0.1364 | 1.4× |
+| e3nn 16x0e, NequIP SiLU | 55,578 | 0.1239 | 1.5× |
+| e3nn 16x0e, ScalarMix | 57,162 | 0.1208 | 1.5× |
+| e3nn 64x0e, uvu, ScalarMix | 90,666 | 0.1130 | 1.6× |
+| e3nn 64x0e + MACE fc + EMA | 90,666 | **0.0852** | **2.2×** |
+
+Gap reduced from 3.0× → 1.9× (still converging at ep100).
+
+---
+
+### Why e3nn is hard to train: the bilinear coupling problem
+
+This is the fundamental reason e3nn models need careful engineering:
 
 ```
-KronHamModel (ScalarMPNN):         MAE = 0.0459   ← 1.0×
-KronHamModelE3NN (FlexEquivMP L=0):MAE = 0.1364   ← 3.0× worse
+Scalar model message:
+  gate = sigmoid(MLP(rbf))    # bounded ∈ (0,1) — one learned quantity
+  msg  = gate ⊙ h_j           # gate × features
+
+e3nn model message (uvu, L=0):
+  w   = fc(rbf)               # unbounded — jointly learned
+  msg = w ⊙ h_j               # two simultaneously-optimized quantities × each other
 ```
 
-Both models see identical information and feed into the same `KronHamCore`.
-The gap is purely architectural:
+The message is **bilinear** in two co-trained quantities `w(θ_fc)` and `h(θ_model)`.
+Their gradients are coupled:
 
-| Model | Aggregation step | Expressiveness |
-|-------|-----------------|----------------|
-| ScalarMPNN | `h_i ← MLP(cat(h_i,  Σ_j w(d_ij)·h_j))` | Nonlinear: mixes self + message |
-| FlexEquivMP L=0 | `h_i ← Linear(Σ_j TP_L0(h_j, w(d_ij))) + h_i` | Linear: aggregation only |
+```
+∂L/∂θ_fc ∝ ∂L/∂aggr · h_j        ← conditioned on current h
+∂L/∂h_j  ∝ ∂L/∂aggr · w(r_ij)   ← conditioned on current w
+```
 
-An L=0 tensor product is just a scalar multiplication — the whole layer reduces to a
-linear weighted sum plus a residual skip. No amount of hyperparameter tuning will
-overcome this: the gap is a theorem about the function class, not a training artefact.
+If `h_j` is miscalibrated early in training → bad gradient to `fc`.
+If `fc` produces bad `w` → corrupted updates to `h_j`.
+Both fight each other → non-monotone MAE curves, slow convergence, overfitting.
 
-**What must change to close the gap:**
-- Add a nonlinear self-interaction MLP after the aggregation step in FlexEquivMP
-- Or use a gated nonlinearity (standard in NequIP / MACE)
-- Only then add L>0 channels — adding higher-order irreps to a linear backbone just
-  introduces noise without expressive benefit
+**Three consequences observed:**
+1. Non-monotone MAE early (ep40 > ep20) — co-adaptation transients
+2. Overfitting at 64x0e without LayerNorm — `w` scale blows up as mul grows
+3. EMA helps — averages over the bilinear co-adaptation oscillations
+
+**What MACE does to tame bilinear coupling:**
+- `LayerNorm` inside `fc` → keeps `w` well-conditioned regardless of `h` magnitude
+- `EMA (decay=0.99)` → smooths over transients
+- Bessel basis (vs Gaussian RBF) → orthogonal, smoother gradients for `fc`
+- `ReduceLROnPlateau` → backs off when coupling oscillates
+
+**Scalar model avoids this entirely:** `sigmoid` bounds the gate to (0,1), breaking
+the unbounded feedback loop. This is a structural advantage of scalar architectures
+for purely invariant tasks.
 
 ### Run the experiment
 
 ```bash
-python train_coulomb.py   # full training + comparison (~3 minutes on CPU)
+python train_coulomb.py                          # all models (full comparison)
+python train_coulomb.py --models e3nn-64         # just the 64x0e variant
+python train_coulomb.py --models scalar e3nn-64  # compare scalar vs best e3nn
+python train_coulomb.py --models e3nn-64 --epochs 200  # longer run
 ```
+
+Available model keys: `local`, `scalar`, `e3nn-none`, `e3nn-nequip`, `e3nn-scalarmix`, `e3nn-64`
 
 ## 文件结构
 

@@ -449,7 +449,6 @@ class KronHamModel(nn.Module):
 
 try:
     from e3nn.o3 import Irreps, TensorProduct, SphericalHarmonics, Linear as E3Linear
-    from e3nn.nn import FullyConnectedNet
     from model_v2 import build_edge_index as _e3nn_build_edges
 
     class FlexEquivMP(nn.Module):
@@ -473,31 +472,41 @@ try:
         def __init__(self, node_irreps: str, edge_sh_lmax: int = 2,
                      fc_hidden: list = [32, 32],
                      n_rbf: int = 20, cutoff: float = 4.0,
-                     self_interaction: str = 'none'):
+                     self_interaction: str = 'none',
+                     tp_mode: str = 'uvw'):
             """
+            tp_mode selects the TensorProduct contraction mode:
+
+              'uvw'   Full bilinear: output_u = Σ_v Σ_w W_{uvw} · in1_u · in2_v
+                      weight_count per instruction = mul_in1 × mul_in2 × mul_out
+                      No multiplicity constraint — works with mixed muls (16x0e+4x1o+2x2e).
+                      Scales as mul²: 16×0e → 256 weights, 64×0e → 4096 weights (too large).
+
+              'uvu'   Per-channel scalar gate: output_u = Σ_v W_u · in1_u · in2_v
+                      weight_count per instruction = mul_in1 × mul_in2
+                      Constraint: mul_in1 == mul_out (same channel count in/out).
+                      Scales as mul: 64×0e → 64 weights per instruction.
+                      Semantics: each output channel u is a distance-gated version of
+                      the same input channel u — like SchNet's interaction layer.
+                      Cross-channel mixing then comes entirely from self_interaction MLP.
+                      Best used with uniform-mul irreps (e.g. '64x0e') + scalar_mix.
+
             self_interaction controls the nonlinear update on L=0 scalar channels:
 
-              'none'        h_i ← Linear(Σ_j TP(h_j,Y,w)) + h_i
-                            Pure linear — baseline, 3× worse than ScalarMPNN for L=0.
+              'none'        h_i ← Linear(aggr) + h_i                  [linear only]
+              'nequip'      h_i_L0 ← SiLU(Linear(h_out_L0))           [NequIP gate]
+              'scalar_mix'  h_i_L0 ← h_out_L0 + MLP(cat(h_self, h_msg)) [SchNet/ScalarMPNN style]
 
-              'nequip'      h_i_L0 ← SiLU(Linear(h_out_L0))
-                            NequIP-style: apply SiLU to the combined (residual+aggregated)
-                            L=0 channels.  Single linear + activation, no explicit self/msg
-                            separation.
-
-              'scalar_mix'  h_i_L0 ← h_out_L0 + MLP(cat(h_self_L0, h_aggr_L0))
-                            ScalarMPNN-style: 2-layer MLP explicitly mixes pre-update self
-                            features with raw aggregated L=0 messages, then adds residually.
-                            Slightly more expressive than 'nequip' — can distinguish which
-                            part of the signal came from self vs neighbours.
-
-            L=0 scalars are SO(3)-invariant, so any function of them preserves equivariance.
-            For L>0 channels: gating (NequIP/MACE style) will be added when we include L>0.
+            Recommended combinations:
+              '16x0e' + 'uvw' + 'none'        → baseline (linear, 3× gap to scalar)
+              '16x0e' + 'uvw' + 'scalar_mix'  → slightly better (+10%), still 2.6× gap
+              '64x0e' + 'uvu' + 'scalar_mix'  → matches scalar dim, ~90k params ← try this
             """
             super().__init__()
-            self.node_irreps    = Irreps(node_irreps)
+            self.node_irreps     = Irreps(node_irreps)
             self.self_interaction = self_interaction
-            edge_sh_irreps      = Irreps.spherical_harmonics(edge_sh_lmax)
+            self.tp_mode         = tp_mode
+            edge_sh_irreps       = Irreps.spherical_harmonics(edge_sh_lmax)
             self.sh = SphericalHarmonics(edge_sh_irreps, normalize=True,
                                          normalization='component')
 
@@ -507,24 +516,35 @@ try:
             self.rbf    = GaussianRBF(n_rbf=n_rbf, r_max=cutoff)
             self.cutoff = cutoff
 
-            # Build instructions using 'uvw' — no equal-mul constraint
+            # Build TP instructions for the chosen mode.
+            # 'uvw': all valid couplings, full bilinear mixing (weight_count = mul_i*mul_k)
+            # 'uvu': per-channel gate only where mul_in == mul_out (weight_count = mul_i)
             instructions = []
             for i, (mul_i, ir_i) in enumerate(self.node_irreps):
                 for j, (_, ir_j) in enumerate(edge_sh_irreps):
                     for k, (mul_k, ir_k) in enumerate(self.node_irreps):
                         if ir_k in ir_i * ir_j:
-                            instructions.append((i, j, k, 'uvw', True))
+                            if tp_mode == 'uvu':
+                                if mul_i == mul_k:   # uvu constraint: same channel count
+                                    instructions.append((i, j, k, 'uvu', True))
+                            else:
+                                instructions.append((i, j, k, 'uvw', True))
 
             self.tp = TensorProduct(
                 self.node_irreps, edge_sh_irreps, self.node_irreps,
                 instructions=instructions,
                 shared_weights=False, internal_weights=False,
             )
-            # fc: RBF features (20) → TP weights   (was: raw dist (1) → TP weights)
-            self.fc = FullyConnectedNet(
-                [n_rbf] + fc_hidden + [self.tp.weight_numel],
-                act=F.silu,
-            )
+            # fc: RBF features → TP weights
+            # MACE-style: Linear → LayerNorm → SiLU per hidden layer.
+            # LayerNorm is critical: without it the TP weight scale blows up as
+            # multiplicity grows (16x0e OK, 64x0e overfit badly without LN).
+            _fc_layers: list = []
+            _dims = [n_rbf] + fc_hidden
+            for _a, _b in zip(_dims, _dims[1:]):
+                _fc_layers += [nn.Linear(_a, _b), nn.LayerNorm(_b), nn.SiLU()]
+            _fc_layers.append(nn.Linear(_dims[-1], self.tp.weight_numel))
+            self.fc = nn.Sequential(*_fc_layers)
             self.linear = E3Linear(self.node_irreps, self.node_irreps)
 
             # ── Nonlinear self-interaction on L=0 scalar channels ────────────
@@ -618,6 +638,7 @@ try:
             K:                int   = 4,
             k_states:         int   = 8,
             self_interaction: str   = 'none',  # 'none' | 'nequip' | 'scalar_mix'
+            tp_mode:          str   = 'uvw',   # 'uvw' (full bilinear) | 'uvu' (per-channel gate)
         ):
             super().__init__()
             self.cutoff = cutoff
@@ -642,7 +663,8 @@ try:
             self.mp_layers = nn.ModuleList([
                 FlexEquivMP(node_irreps, edge_sh_lmax,
                             fc_hidden=[32, 32], n_rbf=20, cutoff=cutoff,
-                            self_interaction=self_interaction)
+                            self_interaction=self_interaction,
+                            tp_mode=tp_mode)
                 for _ in range(n_layers)
             ])
 

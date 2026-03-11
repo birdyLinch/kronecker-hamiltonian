@@ -26,10 +26,12 @@ Physics setup:
   E_total = E_AA + E_BB + E_AB   (1/r Coulomb, all atoms carry scalar charges)
 """
 
+import argparse
 import time
 import torch
 import torch.nn as nn
 import numpy as np
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from model_coulomb import (
     generate_dataset,
@@ -40,6 +42,8 @@ from model_coulomb import (
 
 if HAS_E3NN_COULOMB:
     from model_coulomb import KronHamModelE3NN
+
+ALL_MODELS = ['local', 'scalar', 'e3nn-none', 'e3nn-nequip', 'e3nn-scalarmix', 'e3nn-64']
 
 
 # ══════════════════════════════════════════════════════════════
@@ -65,7 +69,7 @@ class Normaliser:
 # Training / evaluation
 # ══════════════════════════════════════════════════════════════
 
-def train_epoch(model, dataset, optimiser, norm: Normaliser, device):
+def train_epoch(model, dataset, optimiser, norm: Normaliser, device, ema_model=None):
     model.train()
     indices    = torch.randperm(len(dataset)).tolist()
     total_loss = 0.0
@@ -90,6 +94,8 @@ def train_epoch(model, dataset, optimiser, norm: Normaliser, device):
         (loss / len(batch)).backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimiser.step()
+        if ema_model is not None:
+            ema_model.update_parameters(model)
         total_loss += (loss / len(batch)).item()
 
     return total_loss / max(1, len(dataset) // BATCH)
@@ -145,7 +151,7 @@ def make_optimizer(model, lr: float, weight_decay: float):
 
 
 def run(model, train_data, test_data, norm, n_epochs, lr, device, label,
-        weight_decay=1e-4, warmup_epochs=10):
+        weight_decay=1e-4, warmup_epochs=10, ema_decay=0.99):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\n{'─'*58}")
     print(f"  {label}  ({n_params:,} params)")
@@ -153,9 +159,10 @@ def run(model, train_data, test_data, norm, n_epochs, lr, device, label,
 
     opt = make_optimizer(model, lr, weight_decay)
 
+    # EMA: shadow copy of weights, evaluated at test time (MACE/NequIP style)
+    ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(ema_decay))
+
     # Linear warmup (0.1×lr → lr) then cosine decay (lr → lr/50)
-    # Warmup gives L>0 channels time to align before LR starts falling —
-    # eliminates the non-monotone test_MAE artifact seen in L=0+1 / L=0+1+2 models.
     warmup = torch.optim.lr_scheduler.LinearLR(
         opt, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
     cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -165,16 +172,15 @@ def run(model, train_data, test_data, norm, n_epochs, lr, device, label,
 
     t0 = time.time()
     for ep in range(1, n_epochs + 1):
-        loss = train_epoch(model, train_data, opt, norm, device)
+        loss = train_epoch(model, train_data, opt, norm, device, ema_model=ema_model)
         sched.step()
         if ep % (n_epochs // 5) == 0 or ep == 1:
-            mae = evaluate(model, test_data, norm, device)
-            # loss is Huber in normalised space; ×std gives rough train-MAE proxy
+            mae = evaluate(ema_model, test_data, norm, device)
             print(f"  epoch {ep:3d}/{n_epochs}  loss={loss:.4f}  "
                   f"test_MAE={mae:.4f}  ({time.time()-t0:.0f}s)"
                   f"  [train≈{loss*norm.std:.4f}]")
 
-    return evaluate(model, test_data, norm, device)
+    return evaluate(ema_model, test_data, norm, device)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -182,22 +188,38 @@ def run(model, train_data, test_data, norm, n_epochs, lr, device, label,
 # ══════════════════════════════════════════════════════════════
 
 def main():
+    parser = argparse.ArgumentParser(description='Kronecker Hamiltonian Coulomb experiment')
+    parser.add_argument(
+        '--models', nargs='+', default=ALL_MODELS,
+        metavar='MODEL',
+        help=(f'models to run (default: all). choices: {ALL_MODELS}'),
+    )
+    parser.add_argument('--epochs', type=int, default=100, help='training epochs (default: 100)')
+    parser.add_argument('--lr',     type=float, default=3e-3, help='learning rate (default: 3e-3)')
+    args = parser.parse_args()
+
+    # validate
+    unknown = [m for m in args.models if m not in ALL_MODELS]
+    if unknown:
+        parser.error(f"unknown model(s): {unknown}. choices: {ALL_MODELS}")
+
     torch.manual_seed(42)
     device = 'cpu'
 
     # ── dataset ─────────────────────────────────────────────
     N_A, N_B     = 5, 5
-    SEPARATION   = 8.0    # Å  >> cutoff → zero A-B edges
-    CLUSTER_STD  = 0.5    # Å  tight clusters, all intra pairs within cutoff
-    CUTOFF       = 4.0    # Å
+    SEPARATION   = 8.0
+    CLUSTER_STD  = 0.5
+    CUTOFF       = 4.0
     CHARGE_SCALE = 1.0
-    N_EPOCHS     = 100
-    LR           = 3e-3
+    N_EPOCHS     = args.epochs
+    LR           = args.lr
 
     print("=" * 58)
     print(" Kronecker Hamiltonian — Long-Range Coulomb Experiment")
     print("=" * 58)
     print(f"\nGeometry: n_A={N_A}, n_B={N_B}, sep={SEPARATION} Å, cutoff={CUTOFF} Å")
+    print(f"Models:   {args.models}  |  epochs={N_EPOCHS}  lr={LR}")
     print("Generating dataset …")
 
     train_data = generate_dataset(1000, N_A, N_B, SEPARATION, CLUSTER_STD, CHARGE_SCALE, seed=0)
@@ -211,86 +233,79 @@ def main():
     print(f"  E_total : std = {np.std(e_totals):.3f}")
     print(f"  E_AB    : std = {np.std(e_abs):.3f}  ← LocalGNN irreducible error floor")
 
-    # ── shared backbone config ───────────────────────────────
-    scalar_cfg = dict(hidden=64, n_rbf=20, cutoff=CUTOFF, n_layers=3)
-    kron_cfg   = dict(basis_dim=4, K=4, k_states=8)
+    # ── shared configs ───────────────────────────────────────
+    scalar_cfg   = dict(hidden=64, n_rbf=20, cutoff=CUTOFF, n_layers=3)
+    kron_cfg     = dict(basis_dim=4, K=4, k_states=8)
+    e3nn_base    = dict(hidden=64, edge_sh_lmax=2, n_layers=3, cutoff=CUTOFF, **kron_cfg)
 
+    # ── model table ─────────────────────────────────────────
+    # short_name → (display_label, factory)
+    model_table = {
+        'local': (
+            'LocalGNN (no e3nn, no Kronecker)',
+            lambda: LocalGNN(**scalar_cfg).to(device),
+        ),
+        'scalar': (
+            'KronHamModel (no e3nn, +Kronecker)',
+            lambda: KronHamModel(**scalar_cfg, **kron_cfg).to(device),
+        ),
+        'e3nn-none': (
+            'KronHamModelE3NN (16x0e, uvw, linear)',
+            lambda: KronHamModelE3NN(**e3nn_base, node_irreps='16x0e',
+                                     self_interaction='none', tp_mode='uvw').to(device),
+        ),
+        'e3nn-nequip': (
+            'KronHamModelE3NN (16x0e, uvw, NequIP)',
+            lambda: KronHamModelE3NN(**e3nn_base, node_irreps='16x0e',
+                                     self_interaction='nequip', tp_mode='uvw').to(device),
+        ),
+        'e3nn-scalarmix': (
+            'KronHamModelE3NN (16x0e, uvw, ScalarMix)',
+            lambda: KronHamModelE3NN(**e3nn_base, node_irreps='16x0e',
+                                     self_interaction='scalar_mix', tp_mode='uvw').to(device),
+        ),
+        'e3nn-64': (
+            'KronHamModelE3NN (64x0e, uvu, ScalarMix)',
+            lambda: KronHamModelE3NN(**e3nn_base, node_irreps='64x0e',
+                                     self_interaction='scalar_mix', tp_mode='uvu').to(device),
+        ),
+    }
+
+    # ── run selected models ──────────────────────────────────
     results = {}
-
-    # 1. LocalGNN
-    m1 = LocalGNN(**scalar_cfg).to(device)
-    results['LocalGNN (no e3nn, no Kronecker)'] = run(
-        m1, train_data, test_data, norm, N_EPOCHS, LR, device,
-        label='LocalGNN (no e3nn, no Kronecker)',
-    )
-
-    # 2. KronHamModel — pure PyTorch
-    m2 = KronHamModel(**scalar_cfg, **kron_cfg).to(device)
-    results['KronHamModel (no e3nn, +Kronecker)'] = run(
-        m2, train_data, test_data, norm, N_EPOCHS, LR, device,
-        label='KronHamModel (no e3nn, +Kronecker)',
-    )
-
-    # ── e3nn sanity check: three self-interaction variants ───
-    # All use L=0 only (pure scalars, identical information to KronHamModel).
-    # Goal: find which self-interaction style closes the 3× gap vs ScalarMPNN.
-    #
-    #  'none'        current baseline — linear only, known 3× gap
-    #  'nequip'      SiLU(Linear(h_L0_combined)) — NequIP gated nonlinearity
-    #  'scalar_mix'  MLP(cat(h_self_L0, h_aggr_L0)) — explicit self+msg mixing
-    #
-    # L=0 scalars are SO(3)-invariant → all three variants are equivariant.
-    if HAS_E3NN_COULOMB:
-        e3nn_base_cfg = dict(
-            hidden=64, node_irreps='16x0e',
-            edge_sh_lmax=2, n_layers=3,
-            cutoff=CUTOFF, **kron_cfg,
-        )
-        for si_mode in ('none', 'nequip', 'scalar_mix'):
-            label = {
-                'none':        'KronHamModelE3NN (L=0, linear only)',
-                'nequip':      'KronHamModelE3NN (L=0, NequIP SiLU)',
-                'scalar_mix':  'KronHamModelE3NN (L=0, ScalarMix MLP)',
-            }[si_mode]
-            m = KronHamModelE3NN(**e3nn_base_cfg, self_interaction=si_mode).to(device)
-            results[label] = run(
-                m, train_data, test_data, norm, N_EPOCHS, LR, device, label=label,
-            )
-    else:
-        print("\n[skip] e3nn not installed — KronHamModelE3NN not tested")
+    for key in args.models:
+        label, factory = model_table[key]
+        if key.startswith('e3nn') and not HAS_E3NN_COULOMB:
+            print(f"\n[skip] {label} — e3nn not installed")
+            continue
+        m = factory()
+        results[label] = run(m, train_data, test_data, norm, N_EPOCHS, LR, device, label=label)
 
     # ── summary ──────────────────────────────────────────────
+    if not results:
+        return
+
     std_e_ab  = float(np.std([s['E_AB'].item() for s in test_data]))
-    mae_local = results['LocalGNN (no e3nn, no Kronecker)']
+    mae_local = results.get('LocalGNN (no e3nn, no Kronecker)')
     mae_kron  = results.get('KronHamModel (no e3nn, +Kronecker)')
 
     print(f"\n{'='*58}")
     print(" Results Summary")
     print(f"{'='*58}")
     print(f"  std(E_AB) test = {std_e_ab:.4f}  ← LocalGNN cannot beat this\n")
-    print(f"  {'Model':<46} {'MAE':>7}  {'vs LocalGNN':>11}")
-    print(f"  {'-'*66}")
+    print(f"  {'Model':<50} {'MAE':>7}  {'vs scalar':>10}")
+    print(f"  {'-'*70}")
     for name, mae in results.items():
-        vs = f"{mae_local/mae:.1f}x better" if mae < mae_local else "—"
-        print(f"  {name:<46} {mae:>7.4f}  {vs:>11}")
+        if mae_kron:
+            vs = f"{mae_kron/mae:.2f}x" if mae > mae_kron * 0.5 else f"{mae_kron/mae:.1f}x better"
+        elif mae_local:
+            vs = f"{mae_local/mae:.1f}x better" if mae < mae_local else "—"
+        else:
+            vs = "—"
+        print(f"  {name:<50} {mae:>7.4f}  {vs:>10}")
 
-    print()
-    if mae_kron and mae_kron < mae_local * 0.80:
-        print("✓ Kronecker spectral coupling captures long-range E_AB")
-
-    # Self-interaction comparison
-    mae_none  = results.get('KronHamModelE3NN (L=0, linear only)')
-    mae_neq   = results.get('KronHamModelE3NN (L=0, NequIP SiLU)')
-    mae_smix  = results.get('KronHamModelE3NN (L=0, ScalarMix MLP)')
-    if mae_kron and mae_none:
-        print(f"\n── Self-interaction ablation (target: scalar={mae_kron:.4f}) ──")
-        for name, mae in [('none (linear)', mae_none),
-                          ('NequIP SiLU',   mae_neq),
-                          ('ScalarMix MLP', mae_smix)]:
-            if mae is not None:
-                ratio = mae_kron / mae
-                flag = "✓ matched" if 0.7 < ratio < 1.3 else ("↑ improved" if ratio > 0.8 else "⚠ gap")
-                print(f"  {name:<16} MAE={mae:.4f}  ratio={ratio:.2f}x  {flag}")
+    if mae_kron and mae_local and mae_kron < mae_local * 0.80:
+        print("\n✓ Kronecker spectral coupling captures long-range E_AB")
 
 
 if __name__ == '__main__':
