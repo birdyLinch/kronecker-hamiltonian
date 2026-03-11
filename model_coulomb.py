@@ -247,7 +247,9 @@ class KronHamCore(nn.Module):
         basis_dim: int   = 4,
         K:         int   = 4,
         k_states:  int   = 8,
-        perturb:   float = 1e-3,   # was 1e-6 — too small relative to natural gap ~0.05
+        perturb:   float = 1e-6,   # small jitter prevents exact degeneracy NaN in eigvalsh
+                                   # NOTE: larger values (1e-3) over-stabilise eigenvalues →
+                                   # training samples become too distinguishable → overfitting
     ):
         super().__init__()
         self.basis_dim = basis_dim
