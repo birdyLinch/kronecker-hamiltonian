@@ -472,9 +472,31 @@ try:
 
         def __init__(self, node_irreps: str, edge_sh_lmax: int = 2,
                      fc_hidden: list = [32, 32],
-                     n_rbf: int = 20, cutoff: float = 4.0):
+                     n_rbf: int = 20, cutoff: float = 4.0,
+                     self_interaction: str = 'none'):
+            """
+            self_interaction controls the nonlinear update on L=0 scalar channels:
+
+              'none'        h_i ← Linear(Σ_j TP(h_j,Y,w)) + h_i
+                            Pure linear — baseline, 3× worse than ScalarMPNN for L=0.
+
+              'nequip'      h_i_L0 ← SiLU(Linear(h_out_L0))
+                            NequIP-style: apply SiLU to the combined (residual+aggregated)
+                            L=0 channels.  Single linear + activation, no explicit self/msg
+                            separation.
+
+              'scalar_mix'  h_i_L0 ← h_out_L0 + MLP(cat(h_self_L0, h_aggr_L0))
+                            ScalarMPNN-style: 2-layer MLP explicitly mixes pre-update self
+                            features with raw aggregated L=0 messages, then adds residually.
+                            Slightly more expressive than 'nequip' — can distinguish which
+                            part of the signal came from self vs neighbours.
+
+            L=0 scalars are SO(3)-invariant, so any function of them preserves equivariance.
+            For L>0 channels: gating (NequIP/MACE style) will be added when we include L>0.
+            """
             super().__init__()
             self.node_irreps    = Irreps(node_irreps)
+            self.self_interaction = self_interaction
             edge_sh_irreps      = Irreps.spherical_harmonics(edge_sh_lmax)
             self.sh = SphericalHarmonics(edge_sh_irreps, normalize=True,
                                          normalization='component')
@@ -505,6 +527,25 @@ try:
             )
             self.linear = E3Linear(self.node_irreps, self.node_irreps)
 
+            # ── Nonlinear self-interaction on L=0 scalar channels ────────────
+            self.scalar_mul = sum(mul for mul, ir in self.node_irreps if ir.l == 0)
+            s = self.scalar_mul
+            if self_interaction == 'nequip' and s > 0:
+                # NequIP-style: Linear + SiLU on combined (residual+aggr) L=0 channels.
+                # Matches NequIP's gated nonlinearity for scalars:
+                #   h_L0_new = SiLU(W · h_L0_combined)
+                self.self_net = nn.Linear(s, s)
+            elif self_interaction == 'scalar_mix' and s > 0:
+                # ScalarMPNN-style: 2-layer MLP on cat(h_self_L0, h_aggr_L0).
+                # Explicitly mixes self-features and aggregated messages — slightly
+                # more expressive than 'nequip' since it can distinguish the two.
+                self.self_net = nn.Sequential(
+                    nn.Linear(2 * s, s), nn.SiLU(),
+                    nn.Linear(s, s),
+                )
+            else:
+                self.self_net = None
+
         def forward(self, node_feat: Tensor, edge_index: Tensor,
                     edge_vec: Tensor) -> Tensor:
             src, dst    = edge_index
@@ -517,7 +558,25 @@ try:
             msg         = self.tp(node_feat[src], edge_sh, tp_weights)
             aggr        = torch.zeros_like(node_feat)
             aggr.scatter_add_(0, dst.unsqueeze(-1).expand_as(msg), msg)
-            return self.linear(aggr) + node_feat   # residual
+
+            # Equivariant linear + residual (same for all variants)
+            h_out = self.linear(aggr) + node_feat         # [N, irreps.dim]
+
+            s = self.scalar_mul
+            if self.self_interaction == 'nequip' and self.self_net is not None:
+                # NequIP: SiLU(Linear(combined L=0))
+                # h_out[:, :s] already = Linear(aggr)_L0 + node_feat_L0
+                h_scalar_new = F.silu(self.self_net(h_out[:, :s]))
+                h_out = torch.cat([h_scalar_new, h_out[:, s:]], dim=-1)
+
+            elif self.self_interaction == 'scalar_mix' and self.self_net is not None:
+                # ScalarMix: MLP(cat(h_self_L0, h_aggr_L0)) added as residual
+                h_self = node_feat[:, :s]   # L=0 self-features before this layer
+                h_msg  = aggr[:, :s]        # L=0 aggregated messages (pre-linear)
+                delta  = self.self_net(torch.cat([h_self, h_msg], dim=-1))
+                h_out  = torch.cat([h_out[:, :s] + delta, h_out[:, s:]], dim=-1)
+
+            return h_out
 
     class KronHamModelE3NN(nn.Module):
         """
@@ -550,14 +609,15 @@ try:
 
         def __init__(
             self,
-            hidden:       int   = 64,
-            node_irreps:  str   = "16x0e + 4x1o + 2x2e",  # uvw allows mixed muls!
-            edge_sh_lmax: int   = 2,
-            n_layers:     int   = 3,
-            cutoff:       float = 4.0,
-            basis_dim:    int   = 4,
-            K:            int   = 4,
-            k_states:     int   = 8,
+            hidden:           int   = 64,
+            node_irreps:      str   = "16x0e + 4x1o + 2x2e",  # uvw allows mixed muls!
+            edge_sh_lmax:     int   = 2,
+            n_layers:         int   = 3,
+            cutoff:           float = 4.0,
+            basis_dim:        int   = 4,
+            K:                int   = 4,
+            k_states:         int   = 8,
+            self_interaction: str   = 'none',  # 'none' | 'nequip' | 'scalar_mix'
         ):
             super().__init__()
             self.cutoff = cutoff
@@ -581,7 +641,8 @@ try:
             # Pass cutoff so FlexEquivMP can use RBF+envelope (same as ScalarMPNN)
             self.mp_layers = nn.ModuleList([
                 FlexEquivMP(node_irreps, edge_sh_lmax,
-                            fc_hidden=[32, 32], n_rbf=20, cutoff=cutoff)
+                            fc_hidden=[32, 32], n_rbf=20, cutoff=cutoff,
+                            self_interaction=self_interaction)
                 for _ in range(n_layers)
             ])
 

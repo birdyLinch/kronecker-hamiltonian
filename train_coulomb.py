@@ -1,29 +1,29 @@
 """
 train_coulomb.py
 ================
-Train and compare three models on the long-range Coulomb dataset:
+Train and compare models on the long-range Coulomb dataset:
 
-  1. LocalGNN          — scalar MPNN, per-atom sum       (no e3nn, no Kronecker)
-  2. KronHamModel      — scalar MPNN + Kronecker core    (no e3nn, +Kronecker)
-  3. KronHamModelE3NN  — equivariant MPNN + Kronecker    (e3nn backbone, +Kronecker)
+  1. LocalGNN                              — scalar MPNN, per-atom sum  (no Kronecker)
+  2. KronHamModel                          — scalar MPNN + Kronecker core
+  3. KronHamModelE3NN (L=0, linear only)  — e3nn, no self-interaction   [baseline]
+  4. KronHamModelE3NN (L=0, NequIP SiLU)  — e3nn + SiLU(Linear(h_L0))
+  5. KronHamModelE3NN (L=0, ScalarMix)    — e3nn + MLP(cat(h_self, h_msg))
 
-All three share the same:
-  • forward(charges, pos, subsystem_ids) → {'energy': ...} API
-  • continuous scalar charge input: nn.Linear(1, ·) — NOT nn.Embedding(atom_type)
-  • KronHamCore (models 2 & 3 only)
+Models 3-5 are an ablation of the self-interaction style in FlexEquivMP.
+All use node_irreps='16x0e' (pure scalars), so equivariance is trivially satisfied
+and the only variable is how nonlinearly the scalar channels are updated.
 
-Key question: does e3nn's rotational equivariance help for this scalar task?
+Key question: which self-interaction style closes the 3× gap between
+e3nn L=0 and the scalar KronHamModel?
+
+  'none'       h_i ← Linear(Σ_j TP(h_j,Y,w)) + h_i          [linear, known 3× gap]
+  'nequip'     h_i_L0 ← SiLU(Linear(h_out_L0))               [NequIP gated scalar]
+  'scalar_mix' h_i_L0 ← h_out_L0 + MLP(cat(h_self, h_aggr))  [ScalarMPNN-style mix]
 
 Physics setup:
   Cluster A (5 atoms, σ=0.5 Å)  ←── 8 Å ───→  Cluster B (5 atoms, σ=0.5 Å)
   GNN cutoff = 4 Å  →  ZERO A-B edges in any model.
   E_total = E_AA + E_BB + E_AB   (1/r Coulomb, all atoms carry scalar charges)
-
-Expected outcome:
-  LocalGNN:         MAE ≈ std(E_AB)        cannot learn long-range at all
-  KronHamModel:     MAE << std(E_AB)       Kronecker spectral coupling helps
-  KronHamModelE3NN: similar to KronHamModel  equivariance has limited benefit
-                    for a scalar energy task with isotropic (Gaussian) clusters
 """
 
 import time
@@ -231,56 +231,66 @@ def main():
         label='KronHamModel (no e3nn, +Kronecker)',
     )
 
-    # e3nn sanity check — L=0 only.
-    # Goal: match KronHamModel (pure PyTorch scalar) with same information.
-    # Once these two converge, we can add L>0 channels with confidence.
+    # ── e3nn sanity check: three self-interaction variants ───
+    # All use L=0 only (pure scalars, identical information to KronHamModel).
+    # Goal: find which self-interaction style closes the 3× gap vs ScalarMPNN.
+    #
+    #  'none'        current baseline — linear only, known 3× gap
+    #  'nequip'      SiLU(Linear(h_L0_combined)) — NequIP gated nonlinearity
+    #  'scalar_mix'  MLP(cat(h_self_L0, h_aggr_L0)) — explicit self+msg mixing
+    #
+    # L=0 scalars are SO(3)-invariant → all three variants are equivariant.
     if HAS_E3NN_COULOMB:
-        m3 = KronHamModelE3NN(
-            hidden=64,
-            node_irreps='16x0e',   # L=0 only — pure scalars, no directional channels
+        e3nn_base_cfg = dict(
+            hidden=64, node_irreps='16x0e',
             edge_sh_lmax=2, n_layers=3,
             cutoff=CUTOFF, **kron_cfg,
-        ).to(device)
-        results['KronHamModelE3NN (L=0 only)'] = run(
-            m3, train_data, test_data, norm, N_EPOCHS, LR, device,
-            label='KronHamModelE3NN (L=0 only)',
         )
+        for si_mode in ('none', 'nequip', 'scalar_mix'):
+            label = {
+                'none':        'KronHamModelE3NN (L=0, linear only)',
+                'nequip':      'KronHamModelE3NN (L=0, NequIP SiLU)',
+                'scalar_mix':  'KronHamModelE3NN (L=0, ScalarMix MLP)',
+            }[si_mode]
+            m = KronHamModelE3NN(**e3nn_base_cfg, self_interaction=si_mode).to(device)
+            results[label] = run(
+                m, train_data, test_data, norm, N_EPOCHS, LR, device, label=label,
+            )
     else:
         print("\n[skip] e3nn not installed — KronHamModelE3NN not tested")
 
     # ── summary ──────────────────────────────────────────────
     std_e_ab  = float(np.std([s['E_AB'].item() for s in test_data]))
     mae_local = results['LocalGNN (no e3nn, no Kronecker)']
+    mae_kron  = results.get('KronHamModel (no e3nn, +Kronecker)')
 
     print(f"\n{'='*58}")
     print(" Results Summary")
     print(f"{'='*58}")
     print(f"  std(E_AB) test = {std_e_ab:.4f}  ← LocalGNN cannot beat this\n")
-    print(f"  {'Model':<42} {'MAE':>7}  {'vs LocalGNN':>11}")
-    print(f"  {'-'*62}")
+    print(f"  {'Model':<46} {'MAE':>7}  {'vs LocalGNN':>11}")
+    print(f"  {'-'*66}")
     for name, mae in results.items():
         vs = f"{mae_local/mae:.1f}x better" if mae < mae_local else "—"
-        print(f"  {name:<42} {mae:>7.4f}  {vs:>11}")
+        print(f"  {name:<46} {mae:>7.4f}  {vs:>11}")
 
     print()
-    # Kronecker gain
-    mae_kron = results.get('KronHamModel (no e3nn, +Kronecker)', None)
     if mae_kron and mae_kron < mae_local * 0.80:
         print("✓ Kronecker spectral coupling captures long-range E_AB")
 
-    # Sanity check: L=0-only e3nn vs pure PyTorch scalar
-    # Goal: same information → should give similar MAE.
-    # Gap reveals architectural differences between FlexEquivMP and ScalarMPNN.
-    mae_l0 = results.get('KronHamModelE3NN (L=0 only)', None)
-    if mae_l0 is not None and mae_kron is not None:
-        ratio = mae_kron / mae_l0
-        print(f"\n── Sanity check: L=0-only e3nn vs pure PyTorch ──")
-        print(f"  KronHamModel (scalar):   {mae_kron:.4f}")
-        print(f"  KronHamModelE3NN (L=0):  {mae_l0:.4f}   ratio = {ratio:.2f}x")
-        if 0.7 < ratio < 1.3:
-            print(f"  ✓ Backbones matched — safe to add L>0 channels")
-        else:
-            print(f"  ⚠ Gap remains — diagnose before adding L>0 channels")
+    # Self-interaction comparison
+    mae_none  = results.get('KronHamModelE3NN (L=0, linear only)')
+    mae_neq   = results.get('KronHamModelE3NN (L=0, NequIP SiLU)')
+    mae_smix  = results.get('KronHamModelE3NN (L=0, ScalarMix MLP)')
+    if mae_kron and mae_none:
+        print(f"\n── Self-interaction ablation (target: scalar={mae_kron:.4f}) ──")
+        for name, mae in [('none (linear)', mae_none),
+                          ('NequIP SiLU',   mae_neq),
+                          ('ScalarMix MLP', mae_smix)]:
+            if mae is not None:
+                ratio = mae_kron / mae
+                flag = "✓ matched" if 0.7 < ratio < 1.3 else ("↑ improved" if ratio > 0.8 else "⚠ gap")
+                print(f"  {name:<16} MAE={mae:.4f}  ratio={ratio:.2f}x  {flag}")
 
 
 if __name__ == '__main__':
