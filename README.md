@@ -505,8 +505,14 @@ EMA improves ep100 by 8% and the model is **still converging** at ep100 (not pla
 | e3nn 16x0e, ScalarMix | 57,162 | 0.1208 | 1.5× |
 | e3nn 64x0e, uvu, ScalarMix | 90,666 | 0.1130 | 1.6× |
 | e3nn 64x0e + MACE fc + EMA | 90,666 | **0.0852** | **2.2×** |
+| e3nn 64x0e + sigmoid gate + MLP update (`e3nn-scalarmpnn`) | 90,666 | TBD | TBD |
 
 Gap reduced from 3.0× → 1.9× (still converging at ep100).
+
+`e3nn-scalarmpnn` is the architectural equivalence test: L=0 e3nn with sigmoid-bounded
+TP weights and `h ← h + MLP(cat(h, aggr))` update — making it structurally identical
+to ScalarMPNN. If the gap closes to ~1×, it proves the gap was entirely caused by the
+two design choices (unbounded weights + linear update), not e3nn's framework overhead.
 
 ---
 
@@ -551,16 +557,45 @@ Both fight each other → non-monotone MAE curves, slow convergence, overfitting
 the unbounded feedback loop. This is a structural advantage of scalar architectures
 for purely invariant tasks.
 
+### Step 5 — Architectural equivalence: sigmoid gate + MLP update (`e3nn-scalarmpnn`)
+
+The root-cause analysis predicts the L=0 e3nn gap is 100% caused by two design choices:
+
+| Design choice | e3nn default | ScalarMPNN |
+|--------------|-------------|-----------|
+| TP weight bound | unbounded `fc(rbf)` | `sigmoid(fc(rbf))` ∈ (0,1) |
+| Node update | `Linear(aggr) + h` | `h + MLP(cat(h_self, aggr))` |
+
+`e3nn-scalarmpnn` fixes both simultaneously:
+
+```python
+# In FlexEquivMP.forward:
+tp_weights = torch.sigmoid(self.fc(rbf_feat))        # bounded gate, like ScalarMPNN
+msg        = self.tp(node_feat[src], edge_sh, tp_weights)
+aggr       = scatter_add(msg, dst)
+h_new      = h + self_net(cat(h, aggr))              # MLP update, no Linear(aggr)
+```
+
+For a `64x0e` model this is architecturally identical to ScalarMPNN:
+- `Y⁰₀(r̂) = const` → direction ignored, pure distance model
+- Sigmoid gate ∈ (0,1) → same bounded message as ScalarMPNN
+- `h + MLP(cat(h, aggr))` → exact same update function
+
+**Hypothesis:** `e3nn-scalarmpnn` should train like `scalar` (MAE ~0.05), closing
+the gap entirely. Residual differences (LN inside fc, Y⁰₀ scale factor, `inv_norm →
+to_hidden` projection before KronHamCore) should not affect trainability.
+
 ### Run the experiment
 
 ```bash
-python train_coulomb.py                          # all models (full comparison)
-python train_coulomb.py --models e3nn-64         # just the 64x0e variant
-python train_coulomb.py --models scalar e3nn-64  # compare scalar vs best e3nn
-python train_coulomb.py --models e3nn-64 --epochs 200  # longer run
+python train_coulomb.py                                    # all models (full comparison)
+python train_coulomb.py --models e3nn-64                   # just the 64x0e variant
+python train_coulomb.py --models scalar e3nn-64            # compare scalar vs best e3nn
+python train_coulomb.py --models scalar e3nn-scalarmpnn    # equivalence test ← new
+python train_coulomb.py --models e3nn-64 --epochs 200      # longer run
 ```
 
-Available model keys: `local`, `scalar`, `e3nn-none`, `e3nn-nequip`, `e3nn-scalarmix`, `e3nn-64`
+Available model keys: `local`, `scalar`, `e3nn-none`, `e3nn-nequip`, `e3nn-scalarmix`, `e3nn-64`, `e3nn-scalarmpnn`
 
 ## 文件结构
 
@@ -582,10 +617,13 @@ kronecker_hamiltonian/
 ### Key git commits (Coulomb experiment)
 
 ```
+(HEAD)   Add e3nn-scalarmpnn: sigmoid gate + MLP update (architectural equivalence test)
+87a33b4  MACE-style fc LayerNorm + EMA + argparse CLI: close e3nn gap to 1.9×
+b6c07e1  Add self-interaction ablation to FlexEquivMP (none/nequip/scalar_mix)
 38c9559  Restore gap.std() with clamp — confirmed useful spectral feature
 b251592  Remove gap.std() from spectral features — NaN at degeneracy        [regression]
 479b5f4  Revert perturb 1e-3 → 1e-6: larger value causes overfitting
 5065313  Revert eval_norm: LayerNorm on eigenvalues erases physical scale   [regression]
 10a89a1  Fix three KronHamCore numerical bugs + trim to L=0 sanity check
-4471e6a  Fix FlexEquivMP + optimizer for equivariant Coulomb experiment     ← best result (MAE=0.046)
+4471e6a  Fix FlexEquivMP + optimizer for equivariant Coulomb experiment     ← scalar best (MAE=0.046)
 ```

@@ -473,7 +473,8 @@ try:
                      fc_hidden: list = [32, 32],
                      n_rbf: int = 20, cutoff: float = 4.0,
                      self_interaction: str = 'none',
-                     tp_mode: str = 'uvw'):
+                     tp_mode: str = 'uvw',
+                     use_sigmoid_gate: bool = False):
             """
             tp_mode selects the TensorProduct contraction mode:
 
@@ -496,16 +497,24 @@ try:
               'none'        h_i ← Linear(aggr) + h_i                  [linear only]
               'nequip'      h_i_L0 ← SiLU(Linear(h_out_L0))           [NequIP gate]
               'scalar_mix'  h_i_L0 ← h_out_L0 + MLP(cat(h_self, h_msg)) [SchNet/ScalarMPNN style]
+              'scalar_mpnn' h_i_L0 ← h_i_L0 + MLP(cat(h_self, aggr))  [exact ScalarMPNN update,
+                                       skips Linear(aggr) — only valid for L=0 models]
+
+            use_sigmoid_gate: if True, applies sigmoid() to TP weights before the TP call,
+              bounding them to (0,1) — exactly matching ScalarMPNN's sigmoid gate.
+              Only correct for L=0 models (sigmoid would prevent negative L>0 weights).
 
             Recommended combinations:
-              '16x0e' + 'uvw' + 'none'        → baseline (linear, 3× gap to scalar)
-              '16x0e' + 'uvw' + 'scalar_mix'  → slightly better (+10%), still 2.6× gap
-              '64x0e' + 'uvu' + 'scalar_mix'  → matches scalar dim, ~90k params ← try this
+              '16x0e' + 'uvw' + 'none'                     → baseline (linear, 3× gap to scalar)
+              '16x0e' + 'uvw' + 'scalar_mix'               → slightly better (+10%), still 2.6× gap
+              '64x0e' + 'uvu' + 'scalar_mix'               → matches scalar dim, ~90k params
+              '64x0e' + 'uvu' + 'scalar_mpnn' + sigmoid    → architecturally ≡ ScalarMPNN ← new
             """
             super().__init__()
-            self.node_irreps     = Irreps(node_irreps)
-            self.self_interaction = self_interaction
-            self.tp_mode         = tp_mode
+            self.node_irreps      = Irreps(node_irreps)
+            self.self_interaction  = self_interaction
+            self.tp_mode           = tp_mode
+            self.use_sigmoid_gate  = use_sigmoid_gate
             edge_sh_irreps       = Irreps.spherical_harmonics(edge_sh_lmax)
             self.sh = SphericalHarmonics(edge_sh_irreps, normalize=True,
                                          normalization='component')
@@ -563,6 +572,16 @@ try:
                     nn.Linear(2 * s, s), nn.SiLU(),
                     nn.Linear(s, s),
                 )
+            elif self_interaction == 'scalar_mpnn' and s > 0:
+                # Exact ScalarMPNN update: h ← h + MLP(cat(h_self, aggr)).
+                # Unlike scalar_mix, this REPLACES Linear(aggr)+h entirely for L=0
+                # channels — no additive linear term. Combined with use_sigmoid_gate=True,
+                # this makes the L=0 e3nn layer architecturally identical to ScalarMPNN.
+                # Only valid for L=0-only models (no L>0 channels to worry about).
+                self.self_net = nn.Sequential(
+                    nn.Linear(2 * s, s), nn.SiLU(),
+                    nn.Linear(s, s),
+                )
             else:
                 self.self_net = None
 
@@ -575,6 +594,10 @@ try:
             envelope    = 0.5 * (1 + torch.cos(torch.pi * dist / self.cutoff))
             rbf_feat    = self.rbf(dist) * envelope.unsqueeze(-1)  # [E, n_rbf]
             tp_weights  = self.fc(rbf_feat)               # [E, weight_numel]
+            if self.use_sigmoid_gate:
+                # Bound TP weights to (0,1) — matches ScalarMPNN's sigmoid gate.
+                # Breaks bilinear co-adaptation: W is bounded regardless of h magnitude.
+                tp_weights = torch.sigmoid(tp_weights)
             msg         = self.tp(node_feat[src], edge_sh, tp_weights)
             aggr        = torch.zeros_like(node_feat)
             aggr.scatter_add_(0, dst.unsqueeze(-1).expand_as(msg), msg)
@@ -595,6 +618,15 @@ try:
                 h_msg  = aggr[:, :s]        # L=0 aggregated messages (pre-linear)
                 delta  = self.self_net(torch.cat([h_self, h_msg], dim=-1))
                 h_out  = torch.cat([h_out[:, :s] + delta, h_out[:, s:]], dim=-1)
+
+            elif self.self_interaction == 'scalar_mpnn' and self.self_net is not None:
+                # Exact ScalarMPNN update: h_L0 ← h_L0 + MLP(cat(h_self_L0, aggr_L0))
+                # Replaces Linear(aggr)_L0 + h_L0 (from h_out) entirely.
+                # h_out[:, s:] carries L>0 channels unchanged (Linear(aggr) + h for those).
+                h_self   = node_feat[:, :s]
+                h_L0_new = h_self + self.self_net(torch.cat([h_self, aggr[:, :s]], dim=-1))
+                h_out    = torch.cat([h_L0_new, h_out[:, s:]], dim=-1) \
+                           if h_out.shape[1] > s else h_L0_new
 
             return h_out
 
@@ -637,8 +669,9 @@ try:
             basis_dim:        int   = 4,
             K:                int   = 4,
             k_states:         int   = 8,
-            self_interaction: str   = 'none',  # 'none' | 'nequip' | 'scalar_mix'
-            tp_mode:          str   = 'uvw',   # 'uvw' (full bilinear) | 'uvu' (per-channel gate)
+            self_interaction:  str   = 'none',   # 'none' | 'nequip' | 'scalar_mix' | 'scalar_mpnn'
+            tp_mode:           str   = 'uvw',    # 'uvw' (full bilinear) | 'uvu' (per-channel gate)
+            use_sigmoid_gate:  bool  = False,    # bound TP weights to (0,1) like ScalarMPNN
         ):
             super().__init__()
             self.cutoff = cutoff
@@ -664,7 +697,8 @@ try:
                 FlexEquivMP(node_irreps, edge_sh_lmax,
                             fc_hidden=[32, 32], n_rbf=20, cutoff=cutoff,
                             self_interaction=self_interaction,
-                            tp_mode=tp_mode)
+                            tp_mode=tp_mode,
+                            use_sigmoid_gate=use_sigmoid_gate)
                 for _ in range(n_layers)
             ])
 

@@ -43,7 +43,7 @@ from model_coulomb import (
 if HAS_E3NN_COULOMB:
     from model_coulomb import KronHamModelE3NN
 
-ALL_MODELS = ['local', 'scalar', 'e3nn-none', 'e3nn-nequip', 'e3nn-scalarmix', 'e3nn-64']
+ALL_MODELS = ['local', 'scalar', 'e3nn-none', 'e3nn-nequip', 'e3nn-scalarmix', 'e3nn-64', 'e3nn-scalarmpnn']
 
 
 # ══════════════════════════════════════════════════════════════
@@ -268,6 +268,12 @@ def main():
             'KronHamModelE3NN (64x0e, uvu, ScalarMix)',
             lambda: KronHamModelE3NN(**e3nn_base, node_irreps='64x0e',
                                      self_interaction='scalar_mix', tp_mode='uvu').to(device),
+        ),
+        'e3nn-scalarmpnn': (
+            'KronHamModelE3NN (64x0e, uvu, ScalarMPNN-style: sigmoid gate + MLP update)',
+            lambda: KronHamModelE3NN(**e3nn_base, node_irreps='64x0e',
+                                     self_interaction='scalar_mpnn', tp_mode='uvu',
+                                     use_sigmoid_gate=True).to(device),
         ),
     }
 
