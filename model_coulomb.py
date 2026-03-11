@@ -460,12 +460,19 @@ try:
         """
 
         def __init__(self, node_irreps: str, edge_sh_lmax: int = 2,
-                     fc_hidden: list = [32, 32]):
+                     fc_hidden: list = [32, 32],
+                     n_rbf: int = 20, cutoff: float = 4.0):
             super().__init__()
             self.node_irreps    = Irreps(node_irreps)
             edge_sh_irreps      = Irreps.spherical_harmonics(edge_sh_lmax)
             self.sh = SphericalHarmonics(edge_sh_irreps, normalize=True,
                                          normalization='component')
+
+            # RBF distance encoding — same as ScalarMPNN for fair comparison.
+            # Using 20 RBF features (pre-decomposed distances) instead of raw
+            # distance (1 scalar) makes the fc optimization ~10x easier.
+            self.rbf    = GaussianRBF(n_rbf=n_rbf, r_max=cutoff)
+            self.cutoff = cutoff
 
             # Build instructions using 'uvw' — no equal-mul constraint
             instructions = []
@@ -480,9 +487,9 @@ try:
                 instructions=instructions,
                 shared_weights=False, internal_weights=False,
             )
-            # fc: dist scalar → TP weights
+            # fc: RBF features (20) → TP weights   (was: raw dist (1) → TP weights)
             self.fc = FullyConnectedNet(
-                [1] + fc_hidden + [self.tp.weight_numel],
+                [n_rbf] + fc_hidden + [self.tp.weight_numel],
                 act=F.silu,
             )
             self.linear = E3Linear(self.node_irreps, self.node_irreps)
@@ -491,8 +498,11 @@ try:
                     edge_vec: Tensor) -> Tensor:
             src, dst    = edge_index
             edge_sh     = self.sh(edge_vec)
-            dist        = edge_vec.norm(dim=-1, keepdim=True)
-            tp_weights  = self.fc(dist)
+            dist        = edge_vec.norm(dim=-1)           # [E]
+            # cosine envelope (smooth cutoff, matches ScalarMPNN)
+            envelope    = 0.5 * (1 + torch.cos(torch.pi * dist / self.cutoff))
+            rbf_feat    = self.rbf(dist) * envelope.unsqueeze(-1)  # [E, n_rbf]
+            tp_weights  = self.fc(rbf_feat)               # [E, weight_numel]
             msg         = self.tp(node_feat[src], edge_sh, tp_weights)
             aggr        = torch.zeros_like(node_feat)
             aggr.scatter_add_(0, dst.unsqueeze(-1).expand_as(msg), msg)
@@ -557,8 +567,10 @@ try:
             self.charge_embed = nn.Linear(1, self.scalar_mul)
 
             # ── equivariant message passing (uvw mode → mixed muls allowed) ──
+            # Pass cutoff so FlexEquivMP can use RBF+envelope (same as ScalarMPNN)
             self.mp_layers = nn.ModuleList([
-                FlexEquivMP(node_irreps, edge_sh_lmax, fc_hidden=[32, 32])
+                FlexEquivMP(node_irreps, edge_sh_lmax,
+                            fc_hidden=[32, 32], n_rbf=20, cutoff=cutoff)
                 for _ in range(n_layers)
             ])
 
@@ -600,18 +612,25 @@ try:
                 h = mp(h, edge_index, edge_vec)
 
             # ── Extract ALL rotation-invariant signatures ──────────────────
+            N = h.shape[0]
             # L=0: scalars (directly invariant)
-            h_L0  = h[:, :self.vec_offset]                          # [N, 4]
+            h_L0  = h[:, :self.vec_offset]                           # [N, scalar_mul]
             # L=1: vectors → norms  (‖Rv‖ = ‖v‖ → rotation-invariant)
-            h_L1  = h[:, self.vec_offset:self.tens_offset]          # [N, 4*3]
-            norm_L1 = h_L1.reshape(-1, self.vec_mul, 3).norm(dim=-1)  # [N, 4]
+            h_L1  = h[:, self.vec_offset:self.tens_offset]           # [N, vec_mul*3]
+            if self.vec_mul > 0:
+                norm_L1 = h_L1.reshape(N, self.vec_mul, 3).norm(dim=-1)   # [N, vec_mul]
+            else:
+                norm_L1 = h_L1.new_zeros(N, 0)
             # L=2: tensors → norms  (also rotation-invariant)
-            h_L2  = h[:, self.tens_offset:]                          # [N, 4*5]
-            norm_L2 = h_L2.reshape(-1, self.tens_mul, 5).norm(dim=-1) # [N, 4]
+            h_L2  = h[:, self.tens_offset:]                           # [N, tens_mul*5]
+            if self.tens_mul > 0:
+                norm_L2 = h_L2.reshape(N, self.tens_mul, 5).norm(dim=-1)  # [N, tens_mul]
+            else:
+                norm_L2 = h_L2.new_zeros(N, 0)
 
-            # Concatenate → 12 invariant features, then normalise
+            # Concatenate → inv_dim invariant features, then normalise
             inv = self.inv_norm(
-                torch.cat([h_L0, norm_L1, norm_L2], dim=-1)         # [N, 12]
+                torch.cat([h_L0, norm_L1, norm_L2], dim=-1)          # [N, inv_dim]
             )
 
             # Local energy from invariant features

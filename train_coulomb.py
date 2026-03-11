@@ -82,7 +82,10 @@ def train_epoch(model, dataset, optimiser, norm: Normaliser, device):
                            s['subsystem_ids'].to(device))['energy']
             target = torch.tensor(norm.encode(s['E_total'].item()),
                                   dtype=torch.float32, device=device)
-            loss   = loss + (pred - target) ** 2
+            # Huber loss (δ=0.1 in normalised space ≈ 0.21 eV original):
+            #   quadratic for |err| < δ  → smooth gradient near zero, no plateau
+            #   linear  for |err| > δ  → robust to outliers, asymptotically MAE
+            loss   = loss + torch.nn.functional.huber_loss(pred, target, delta=0.1)
 
         (loss / len(batch)).backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -104,15 +107,61 @@ def evaluate(model, dataset, norm: Normaliser, device):
     return float(np.mean(errs))
 
 
+def make_optimizer(model, lr: float, weight_decay: float):
+    """
+    Per-parameter-group AdamW.
+
+    For plain scalar models (LocalGNN, KronHamModel) all params share one group.
+
+    For equivariant models (KronHamModelE3NN), we use three groups:
+      • TP fc networks  (predict TP weights from RBF) — large weight count, needs
+                         finer steps  → lr × 0.3
+      • E3Linear layers  (equivariant linear, constrained)     → lr × 0.5
+      • Everything else  (charge_embed, KronHamCore, scalars)  → lr × 1.0
+
+    This avoids the non-monotone test_MAE artifact where:
+      the global LR decays before L>0 TP channels have aligned,
+      causing temporary destabilisation of the L=0 learning.
+    """
+    if not hasattr(model, 'mp_layers'):
+        # scalar model — single group
+        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    # equivariant model — split into 3 groups
+    tp_fc_params, e3lin_params, other_params = [], [], []
+    for name, p in model.named_parameters():
+        if 'mp_layers' in name and '.fc.' in name:
+            tp_fc_params.append(p)     # RBF → TP-weight fc networks
+        elif 'mp_layers' in name and '.linear.' in name:
+            e3lin_params.append(p)     # E3Linear layers
+        else:
+            other_params.append(p)     # scalars, KronHamCore, charge_embed, etc.
+
+    return torch.optim.AdamW([
+        {'params': other_params,  'lr': lr,        'name': 'scalar/kron'},
+        {'params': e3lin_params,  'lr': lr * 0.5,  'name': 'E3Linear'},
+        {'params': tp_fc_params,  'lr': lr * 0.3,  'name': 'TP-fc'},
+    ], weight_decay=weight_decay)
+
+
 def run(model, train_data, test_data, norm, n_epochs, lr, device, label,
-        weight_decay=0.0):
+        weight_decay=1e-4, warmup_epochs=10):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\n{'─'*58}")
     print(f"  {label}  ({n_params:,} params)")
     print(f"{'─'*58}")
 
-    opt  = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs, eta_min=lr / 20)
+    opt = make_optimizer(model, lr, weight_decay)
+
+    # Linear warmup (0.1×lr → lr) then cosine decay (lr → lr/50)
+    # Warmup gives L>0 channels time to align before LR starts falling —
+    # eliminates the non-monotone test_MAE artifact seen in L=0+1 / L=0+1+2 models.
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        opt, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=n_epochs - warmup_epochs, eta_min=lr / 50)
+    sched  = torch.optim.lr_scheduler.SequentialLR(
+        opt, schedulers=[warmup, cosine], milestones=[warmup_epochs])
 
     t0 = time.time()
     for ep in range(1, n_epochs + 1):
@@ -120,8 +169,10 @@ def run(model, train_data, test_data, norm, n_epochs, lr, device, label,
         sched.step()
         if ep % (n_epochs // 5) == 0 or ep == 1:
             mae = evaluate(model, test_data, norm, device)
+            # loss is Huber in normalised space; ×std gives rough train-MAE proxy
             print(f"  epoch {ep:3d}/{n_epochs}  loss={loss:.4f}  "
-                  f"test_MAE={mae:.4f}  ({time.time()-t0:.0f}s)")
+                  f"test_MAE={mae:.4f}  ({time.time()-t0:.0f}s)"
+                  f"  [train≈{loss*norm.std:.4f}]")
 
     return evaluate(model, test_data, norm, device)
 
@@ -180,18 +231,28 @@ def main():
         label='KronHamModel (no e3nn, +Kronecker)',
     )
 
-    # 3. KronHamModelE3NN — equivariant backbone (fixed)
+    # L_max ablation: 0 → 0+1 → 0+1+2
+    # For isotropic Coulomb energy, adding higher-L channels should NOT help.
+    # L=0 only serves as the sanity-check baseline (should match pure PyTorch scalar model).
+    e3nn_cfgs = [
+        ('16x0e',            2, 'L=0 only  (sanity check)'),
+        ('16x0e + 4x1o',     2, 'L=0+1'),
+        ('16x0e + 4x1o + 2x2e', 2, 'L=0+1+2'),
+    ]
+
     if HAS_E3NN_COULOMB:
-        m3 = KronHamModelE3NN(
-            hidden=64,
-            node_irreps='16x0e + 4x1o + 2x2e',  # uvw mode: mixed muls now allowed
-            edge_sh_lmax=2, n_layers=3,
-            cutoff=CUTOFF, **kron_cfg,
-        ).to(device)
-        results['KronHamModelE3NN (e3nn, +Kronecker)'] = run(
-            m3, train_data, test_data, norm, N_EPOCHS, LR, device,
-            label='KronHamModelE3NN (e3nn backbone, +Kronecker)',
-        )
+        for irreps_str, lmax, tag in e3nn_cfgs:
+            key = f'KronHamModelE3NN ({tag})'
+            m = KronHamModelE3NN(
+                hidden=64,
+                node_irreps=irreps_str,
+                edge_sh_lmax=lmax, n_layers=3,
+                cutoff=CUTOFF, **kron_cfg,
+            ).to(device)
+            results[key] = run(
+                m, train_data, test_data, norm, N_EPOCHS, LR, device,
+                label=f'KronHamModelE3NN ({tag})',
+            )
     else:
         print("\n[skip] e3nn not installed — KronHamModelE3NN not tested")
 
@@ -215,19 +276,33 @@ def main():
     if mae_kron and mae_kron < mae_local * 0.80:
         print("✓ Kronecker spectral coupling captures long-range E_AB")
 
-    # e3nn vs pure-PyTorch comparison
-    mae_e3nn = results.get('KronHamModelE3NN (e3nn, +Kronecker)', None)
-    if mae_e3nn is not None and mae_kron is not None:
-        ratio = mae_kron / mae_e3nn
-        if   ratio > 1.15:
-            verdict = "✓ e3nn backbone is better  (orientation info helps)"
-        elif ratio < 0.85:
-            verdict = "≈ e3nn backbone is WORSE  (overhead > benefit for scalar task)"
+    # Sanity check: L=0-only e3nn vs pure PyTorch scalar
+    mae_l0  = results.get('KronHamModelE3NN (L=0 only  (sanity check))', None)
+    mae_l01 = results.get('KronHamModelE3NN (L=0+1)', None)
+    mae_l012= results.get('KronHamModelE3NN (L=0+1+2)', None)
+
+    if mae_l0 is not None and mae_kron is not None:
+        ratio = mae_kron / mae_l0
+        print(f"\n── Sanity check: L=0-only e3nn vs pure PyTorch ──")
+        if 0.7 < ratio < 1.3:
+            print(f"✓ L=0-only e3nn ≈ pure PyTorch  ({ratio:.2f}x)  "
+                  f"(same info, different backbone → expected similar MAE)")
         else:
-            verdict = "≈ e3nn and plain PyTorch are similar  (equivariance not decisive)"
-        print(f"{verdict}")
-        print("  (expected: Coulomb energy is scalar/isotropic → equivariance"
-              " less critical than for tensor properties like forces / polarisability)")
+            print(f"⚠ L=0-only e3nn differs from pure PyTorch ({ratio:.2f}x)  "
+                  f"(same scalar info → investigate architecture difference)")
+
+    # L_max ablation: does adding L=1 and L=2 help?
+    if mae_l0 is not None and mae_l01 is not None and mae_l012 is not None:
+        print(f"\n── L_max ablation (Coulomb is isotropic → expect flat or degraded) ──")
+        print(f"  L=0 only : {mae_l0:.4f}")
+        print(f"  L=0+1    : {mae_l01:.4f}   Δ = {mae_l01 - mae_l0:+.4f}")
+        print(f"  L=0+1+2  : {mae_l012:.4f}   Δ = {mae_l012 - mae_l0:+.4f}")
+        if mae_l012 < mae_l0 * 0.85:
+            print("  → Higher-L channels DO help  (unexpected for isotropic task)")
+        elif mae_l0 < mae_l012 * 0.85:
+            print("  → Higher-L channels HURT  (overhead > benefit for scalar task) ✓ expected")
+        else:
+            print("  → Higher-L channels make little difference  (equivariance not decisive) ✓ expected")
 
 
 if __name__ == '__main__':
