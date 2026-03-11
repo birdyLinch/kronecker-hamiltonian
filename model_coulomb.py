@@ -272,8 +272,9 @@ class KronHamCore(nn.Module):
         )
 
         # Spectral feature → energy MLP
-        # Features: k_states global evals + k_states A evals + k_states B evals + 4 cross stats
-        feat_dim = 3 * k_states + 4
+        # Features: k_states global evals + k_states A evals + k_states B evals + 3 cross stats
+        # cross = [gap.min, gap.max, gap.abs.mean]  (std removed — NaN risk at degeneracy)
+        feat_dim = 3 * k_states + 3
         # NOTE: No LayerNorm here — eigenvalue magnitudes carry physical information.
         # E_AB ∝ Σ q_i^A q_j^B / r, encoded in the absolute eigenvalue scale.
         # LayerNorm would erase this signal (confirmed: MAE 0.046 → 0.056 with norm).
@@ -317,13 +318,11 @@ class KronHamCore(nn.Module):
 
         # Cross-spectrum statistics (capture A-B spectral interaction)
         gap = evals_A[:k].unsqueeze(1) - evals_B[:k].unsqueeze(0)  # [k, k]
-        # Bug fix: gap.std() has gradient ∂std/∂x_i = (x_i−mean)/(n·std).
-        # When eigenvalues are degenerate (std→0, e.g. during plateau phase),
-        # this becomes 0/0 = NaN. Clamp variance before sqrt to stay finite.
-        gap_std = (gap.var() + 1e-8).sqrt()
-        cross = torch.stack([gap.min(), gap.max(), gap.abs().mean(), gap_std])
+        # gap.std() removed: ∂std/∂x_i = (x_i−mean)/(n·std) → 0/0 NaN when degenerate.
+        # min/max/mean are all well-behaved subgradients at degeneracy.
+        cross = torch.stack([gap.min(), gap.max(), gap.abs().mean()])
 
-        return torch.cat([feat_g, feat_A, feat_B, cross])   # [3k+4]
+        return torch.cat([feat_g, feat_A, feat_B, cross])   # [3k+3]
 
     def forward(
         self,
