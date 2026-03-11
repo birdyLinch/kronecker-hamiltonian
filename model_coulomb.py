@@ -272,9 +272,9 @@ class KronHamCore(nn.Module):
         )
 
         # Spectral feature → energy MLP
-        # Features: k_states global evals + k_states A evals + k_states B evals + 3 cross stats
-        # cross = [gap.min, gap.max, gap.abs.mean]  (std removed — NaN risk at degeneracy)
-        feat_dim = 3 * k_states + 3
+        # Features: k_states global evals + k_states A evals + k_states B evals + 4 cross stats
+        # cross = [gap.min, gap.max, gap.abs.mean, gap.std]
+        feat_dim = 3 * k_states + 4
         # NOTE: No LayerNorm here — eigenvalue magnitudes carry physical information.
         # E_AB ∝ Σ q_i^A q_j^B / r, encoded in the absolute eigenvalue scale.
         # LayerNorm would erase this signal (confirmed: MAE 0.046 → 0.056 with norm).
@@ -318,11 +318,13 @@ class KronHamCore(nn.Module):
 
         # Cross-spectrum statistics (capture A-B spectral interaction)
         gap = evals_A[:k].unsqueeze(1) - evals_B[:k].unsqueeze(0)  # [k, k]
-        # gap.std() removed: ∂std/∂x_i = (x_i−mean)/(n·std) → 0/0 NaN when degenerate.
-        # min/max/mean are all well-behaved subgradients at degeneracy.
-        cross = torch.stack([gap.min(), gap.max(), gap.abs().mean()])
+        # gap.std() clamped: ∂std/∂x_i = (x_i−mean)/(n·std) → 0/0 NaN when degenerate.
+        # .clamp(min=1e-8) gives gradient=0 at degeneracy (safe) and std elsewhere (informative).
+        # Confirmed useful: removing std entirely caused MAE regression 0.046 → 0.082.
+        cross = torch.stack([gap.min(), gap.max(), gap.abs().mean(),
+                             gap.std().clamp(min=1e-8)])
 
-        return torch.cat([feat_g, feat_A, feat_B, cross])   # [3k+3]
+        return torch.cat([feat_g, feat_A, feat_B, cross])   # [3k+4]
 
     def forward(
         self,
