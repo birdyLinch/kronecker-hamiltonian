@@ -272,10 +272,10 @@ class KronHamCore(nn.Module):
         # Spectral feature → energy MLP
         # Features: k_states global evals + k_states A evals + k_states B evals + 4 cross stats
         feat_dim = 3 * k_states + 4
-        # Bug fix: eigenvalue scale drifts wildly during training (can span −50…+50
-        # depending on backbone output scale). Without LayerNorm, energy_mlp sees a
-        # completely different input distribution each step → causes training instability.
-        self.eval_norm  = nn.LayerNorm(feat_dim)
+        # NOTE: No LayerNorm here — eigenvalue magnitudes carry physical information.
+        # E_AB ∝ Σ q_i^A q_j^B / r, encoded in the absolute eigenvalue scale.
+        # LayerNorm would erase this signal (confirmed: MAE 0.046 → 0.056 with norm).
+        # Training stability is handled by Huber loss + AdamW, not by normalising evals.
         self.energy_mlp = nn.Sequential(
             nn.Linear(feat_dim, 128), nn.SiLU(),
             nn.Linear(128, 64),      nn.SiLU(),
@@ -344,7 +344,7 @@ class KronHamCore(nn.Module):
         evals_B = torch.linalg.eigvalsh(H_B)    # [dim_B], sorted ↑
 
         feat    = self._spectral_features(evals_A, evals_B)
-        E_kron  = self.energy_mlp(self.eval_norm(feat)).squeeze()
+        E_kron  = self.energy_mlp(feat).squeeze()
 
         return {'E_kron': E_kron, 'H_A': H_A, 'H_B': H_B,
                 'evals_A': evals_A, 'evals_B': evals_B}
