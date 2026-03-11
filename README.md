@@ -505,6 +505,7 @@ EMA improves ep100 by 8% and the model is **still converging** at ep100 (not pla
 | e3nn 16x0e, ScalarMix | 57,162 | 0.1208 | 1.5× |
 | e3nn 64x0e, uvu, ScalarMix | 90,666 | 0.1130 | 1.6× |
 | e3nn 64x0e + MACE fc + EMA | 90,666 | **0.0852** | **2.2×** |
+| **e3nn 64x0e, NormSAGE (L=0 only, equiv to scalar_mix)** | **90,666** | **0.0477** | **3.9×** |
 | e3nn 64x0e + sigmoid gate + MLP update (`e3nn-scalarmpnn`) | 90,666 | TBD | TBD |
 
 Gap reduced from 3.0× → 1.9× (still converging at ep100).
@@ -513,6 +514,11 @@ Gap reduced from 3.0× → 1.9× (still converging at ep100).
 TP weights and `h ← h + MLP(cat(h, aggr))` update — making it structurally identical
 to ScalarMPNN. If the gap closes to ~1×, it proves the gap was entirely caused by the
 two design choices (unbounded weights + linear update), not e3nn's framework overhead.
+
+`e3nn-normsage` is the invariant NormSAGE self-interaction variant: in the L=0-only
+configuration used here it is architecturally equivalent to `scalar_mix` and empirically
+achieves MAE ≈ 0.0477 on the Coulomb benchmark (3.9× better than LocalGNN, essentially
+matching the scalar Kronecker model).
 
 ---
 
