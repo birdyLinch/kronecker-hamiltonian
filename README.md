@@ -345,26 +345,98 @@ fingerprints → overfitting (test MAE rises after ep80, ep100 worse than ep80).
 | MSE loss | Slow, noisy | Heavy tail in E_AB distribution |
 | MAE loss | Plateau | Zero gradient near minimum in KronHamCore |
 
-### Open question: e3nn L=0 vs scalar gap
+### e3nn L=0 ablation: commit-by-commit story
+
+Both `KronHamModel` and `KronHamModelE3NN` share the same `KronHamCore`. Every change
+to KronHamCore affects both. This table traces what each commit did to e3nn L=0 MAE:
+
+| Commit | What changed | e3nn L=0 MAE | Δ | Note |
+|--------|-------------|:------------:|:---:|------|
+| (before `4471e6a`) | raw dist (1 scalar) → TP weights | ~0.77 | — | FC maps 1 number → 256 weights |
+| `4471e6a` | ✅ GaussianRBF(20) + cosine envelope + per-group AdamW + warmup | **0.136** | **−82%** | Single biggest improvement |
+| `10a89a1` | ⚠️ +eval_norm +perturb=1e-3; gap.std→clamp(1e-8) | 0.143 | +5% | LayerNorm hurts |
+| `5065313` | ✅ −eval_norm (reverted) | **0.129** | −10% | **Best e3nn run** |
+| `479b5f4` | — perturb 1e-3→1e-6 | ~0.129 | ~0% | perturb has no effect on e3nn |
+| `b251592` | ❌ −gap.std() (removed entirely) | 0.221 | **+71%** | Largest single regression |
+| `38c9559` | ✅ +gap.std().clamp(1e-8) (restored) | 0.136 | −39% | Recovered to baseline |
+
+#### Lessons specific to e3nn L=0
+
+**1. GaussianRBF(20) is the single biggest win (−82%)**
+
+The TP weight network `fc([n_in, 32, 32, n_weights])` must produce smooth radial
+profiles. With raw distance (1 scalar), the FC has to invent smooth functions from
+a point input — nearly impossible. With RBF(20), the inputs already span the radial
+frequency range; the FC just needs a linear combination.
+
+```
+raw dist (1 input):    MAE = 0.77
+GaussianRBF(20):       MAE = 0.136   ← 5.7× improvement
+```
+
+**2. LayerNorm on eigenvalues consistently hurts (both models)**
+
+Eigenvalue magnitudes encode E_AB scale (∝ q_A × q_B / r). Normalising erases this.
+The energy MLP then has to infer the absolute energy scale from normalised ratios alone —
+it can learn the shape of E_AB but not its magnitude.
+
+```
+With LayerNorm:    MAE = 0.143   (+5%)
+Without:           MAE = 0.129   (best)
+```
+
+**3. gap.std() removal is catastrophic for e3nn (even more than for scalar)**
+
+`gap.std()` = spread of cross-subsystem eigenvalue differences = how heterogeneous
+charges are across A and B. This is the single most informative scalar summary of E_AB.
+
+```
+With gap.std().clamp(1e-8):   MAE = 0.129
+Without gap.std():             MAE = 0.221   (+71% regression)
+```
+
+Fix: `.clamp(min=1e-8)` prevents `∂std/∂x → 0/0` at degeneracy while preserving
+the informative signal everywhere else.
+
+**4. perturb has no effect on e3nn L=0 (unlike scalar)**
+
+`perturb=1e-3` caused the scalar model to overfit (stronger backbone memorised the
+more-distinguishable eigenvalue fingerprints). e3nn L=0's weaker linear backbone
+cannot memorise regardless — so perturb size is irrelevant for it.
+
+```
+perturb=1e-3:   e3nn MAE = 0.129,  scalar MAE = 0.073 (overfitting)
+perturb=1e-6:   e3nn MAE = 0.129,  scalar MAE = 0.046 (clean)
+```
+
+This asymmetry reveals that model capacity determines whether perturb matters:
+weak model (e3nn L=0) → immune to memorisation → perturb irrelevant.
+Strong model (ScalarMPNN) → can memorise → perturb must stay small.
+
+### Open question: persistent 3× gap between e3nn L=0 and scalar
 
 ```
 KronHamModel (ScalarMPNN):         MAE = 0.0459   ← 1.0×
 KronHamModelE3NN (FlexEquivMP L=0):MAE = 0.1364   ← 3.0× worse
 ```
 
-Both models pass the same information (scalar charges, intra-cluster geometry) into the
-same KronHamCore. The gap comes purely from the message-passing architecture:
+Both models see identical information and feed into the same `KronHamCore`.
+The gap is purely architectural:
 
-| Architecture | Aggregation | Self-interaction |
-|---|---|---|
-| ScalarMPNN | MLP(cat(h_i, Σ_j w(d_ij) h_j)) | Nonlinear mixing of self + message |
-| FlexEquivMP L=0 | Linear(Σ_j TP_L0(h_j, w(d_ij))) + h_i | Linear aggregation + residual |
+| Model | Aggregation step | Expressiveness |
+|-------|-----------------|----------------|
+| ScalarMPNN | `h_i ← MLP(cat(h_i,  Σ_j w(d_ij)·h_j))` | Nonlinear: mixes self + message |
+| FlexEquivMP L=0 | `h_i ← Linear(Σ_j TP_L0(h_j, w(d_ij))) + h_i` | Linear: aggregation only |
 
-L=0 equivariant = linear operation; scalar MPNN = nonlinear. Same information,
-weaker expressiveness → 3× MAE gap.
+An L=0 tensor product is just a scalar multiplication — the whole layer reduces to a
+linear weighted sum plus a residual skip. No amount of hyperparameter tuning will
+overcome this: the gap is a theorem about the function class, not a training artefact.
 
-**Next step:** close this gap (nonlinear mixing in FlexEquivMP) before adding L>0 channels.
-Adding L>0 with a weak backbone just adds noise.
+**What must change to close the gap:**
+- Add a nonlinear self-interaction MLP after the aggregation step in FlexEquivMP
+- Or use a gated nonlinearity (standard in NequIP / MACE)
+- Only then add L>0 channels — adding higher-order irreps to a linear backbone just
+  introduces noise without expressive benefit
 
 ### Run the experiment
 
