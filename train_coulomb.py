@@ -43,7 +43,9 @@ from model_coulomb import (
 if HAS_E3NN_COULOMB:
     from model_coulomb import KronHamModelE3NN
 
-ALL_MODELS = ['local', 'scalar', 'e3nn-none', 'e3nn-nequip', 'e3nn-scalarmix', 'e3nn-64', 'e3nn-scalarmpnn']
+ALL_MODELS = ['local', 'scalar', 'e3nn-none', 'e3nn-nequip', 'e3nn-scalarmix', 'e3nn-64', 'e3nn-scalarmpnn',
+              'e3nn-sigmoid-only', 'e3nn-mlpupdate-only',
+              'e3nn-normsage', 'e3nn-normsage-mixed']
 
 
 # ══════════════════════════════════════════════════════════════
@@ -274,6 +276,28 @@ def main():
             lambda: KronHamModelE3NN(**e3nn_base, node_irreps='64x0e',
                                      self_interaction='scalar_mpnn', tp_mode='uvu',
                                      use_sigmoid_gate=True).to(device),
+        ),
+        'e3nn-sigmoid-only': (
+            'KronHamModelE3NN (64x0e, uvu, sigmoid gate only, Linear update)',
+            lambda: KronHamModelE3NN(**e3nn_base, node_irreps='64x0e',
+                                     self_interaction='scalar_mix', tp_mode='uvu',
+                                     use_sigmoid_gate=True).to(device),
+        ),
+        'e3nn-mlpupdate-only': (
+            'KronHamModelE3NN (64x0e, uvu, MLP update only, no sigmoid)',
+            lambda: KronHamModelE3NN(**e3nn_base, node_irreps='64x0e',
+                                     self_interaction='scalar_mpnn', tp_mode='uvu',
+                                     use_sigmoid_gate=False).to(device),
+        ),
+        'e3nn-normsage': (
+            'KronHamModelE3NN (64x0e, uvu, NormSAGE — L=0 only, equiv to ScalarMPNN)',
+            lambda: KronHamModelE3NN(**e3nn_base, node_irreps='64x0e',
+                                     self_interaction='norm_sage', tp_mode='uvu').to(device),
+        ),
+        'e3nn-normsage-mixed': (
+            'KronHamModelE3NN (16x0e+4x1o+2x2e, uvw, NormSAGE — L>0 norm gating)',
+            lambda: KronHamModelE3NN(**e3nn_base, node_irreps='16x0e + 4x1o + 2x2e',
+                                     self_interaction='norm_sage', tp_mode='uvw').to(device),
         ),
     }
 

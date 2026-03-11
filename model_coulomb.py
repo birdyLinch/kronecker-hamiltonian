@@ -499,6 +499,10 @@ try:
               'scalar_mix'  h_i_L0 ← h_out_L0 + MLP(cat(h_self, h_msg)) [SchNet/ScalarMPNN style]
               'scalar_mpnn' h_i_L0 ← h_i_L0 + MLP(cat(h_self, aggr))  [exact ScalarMPNN update,
                                        skips Linear(aggr) — only valid for L=0 models]
+              'norm_sage'   gate ← MLP(cat(‖h_self‖_L, ‖aggr‖_L))     [GraphSAGE on norms]
+                            L=0: h_L0 ← h_self_L0 + gate_L0            [scalar_mpnn-style: no Linear(aggr)]
+                            L>0: h_L ← sigmoid(gate_L) * h_L           [per-channel multiplicative gate]
+                            norms are rotation-invariant → MLP is equivariance-safe for all L
 
             use_sigmoid_gate: if True, applies sigmoid() to TP weights before the TP call,
               bounding them to (0,1) — exactly matching ScalarMPNN's sigmoid gate.
@@ -556,8 +560,15 @@ try:
             self.fc = nn.Sequential(*_fc_layers)
             self.linear = E3Linear(self.node_irreps, self.node_irreps)
 
+            # ── Per-L layout (needed for norm extraction in norm_sage) ──────
+            self.scalar_mul  = sum(mul for mul, ir in self.node_irreps if ir.l == 0)
+            self.vec_mul     = sum(mul for mul, ir in self.node_irreps if ir.l == 1)
+            self.tens_mul    = sum(mul for mul, ir in self.node_irreps if ir.l == 2)
+            self.vec_offset  = self.scalar_mul
+            self.tens_offset = self.scalar_mul + self.vec_mul * 3
+            self.inv_dim     = self.scalar_mul + self.vec_mul + self.tens_mul
+
             # ── Nonlinear self-interaction on L=0 scalar channels ────────────
-            self.scalar_mul = sum(mul for mul, ir in self.node_irreps if ir.l == 0)
             s = self.scalar_mul
             if self_interaction == 'nequip' and s > 0:
                 # NequIP-style: Linear + SiLU on combined (residual+aggr) L=0 channels.
@@ -582,8 +593,40 @@ try:
                     nn.Linear(2 * s, s), nn.SiLU(),
                     nn.Linear(s, s),
                 )
+            elif self_interaction == 'norm_sage' and self.inv_dim > 0:
+                # Two-part update: scalar_mpnn for L=0, norm-gate for L>0.
+                #
+                # self_net: exact scalar_mpnn MLP on raw cat(h_self_L0, aggr_L0).
+                #   L=0 scalars are invariant → no need to go through norms.
+                #   h_L0_new = h_self_L0 + self_net(cat(h_self_L0, aggr_L0))
+                #
+                # gate_net: norm-based gate on cat(‖h_self‖_L>0, ‖aggr‖_L>0).
+                #   L>0 features are equivariant → only their norms are invariant.
+                #   h_Lk_new = sigmoid(gate_net(...)) * h_out_Lk  (per-channel scale)
+                self.self_net = nn.Sequential(
+                    nn.Linear(2 * s, s), nn.SiLU(),
+                    nn.Linear(s, s),
+                ) if s > 0 else None
+                high_dim = self.vec_mul + self.tens_mul
+                self.gate_net = nn.Sequential(
+                    nn.Linear(2 * high_dim, high_dim), nn.SiLU(),
+                    nn.Linear(high_dim, high_dim),
+                ) if high_dim > 0 else None
             else:
                 self.self_net = None
+
+        def _extract_norms(self, h: Tensor) -> Tensor:
+            """Extract L=0 scalars + per-channel norms of L>0 blocks → [N, inv_dim].
+            All outputs are rotation-invariant: norms are preserved under SO(3)."""
+            N = h.shape[0]
+            parts = [h[:, :self.vec_offset]]                          # L=0 directly
+            if self.vec_mul > 0:
+                h_L1 = h[:, self.vec_offset:self.tens_offset]         # [N, vec_mul*3]
+                parts.append(h_L1.reshape(N, self.vec_mul, 3).norm(dim=-1))   # [N, vec_mul]
+            if self.tens_mul > 0:
+                h_L2 = h[:, self.tens_offset:]                         # [N, tens_mul*5]
+                parts.append(h_L2.reshape(N, self.tens_mul, 5).norm(dim=-1))  # [N, tens_mul]
+            return torch.cat(parts, dim=-1)                            # [N, inv_dim]
 
         def forward(self, node_feat: Tensor, edge_index: Tensor,
                     edge_vec: Tensor) -> Tensor:
@@ -627,6 +670,57 @@ try:
                 h_L0_new = h_self + self.self_net(torch.cat([h_self, aggr[:, :s]], dim=-1))
                 h_out    = torch.cat([h_L0_new, h_out[:, s:]], dim=-1) \
                            if h_out.shape[1] > s else h_L0_new
+
+            elif self.self_interaction == 'norm_sage':
+                # Two-part update: scalar_mpnn for L=0, norm-gate for L>0.
+                N = h_out.shape[0]
+                parts = []
+
+                # L=0: exact scalar_mpnn — MLP on raw features, residual from h_self.
+                if self.self_net is not None:
+                    h_self_L0 = node_feat[:, :self.vec_offset]        # [N, scalar_mul]
+                    aggr_L0   = aggr[:, :self.vec_offset]              # [N, scalar_mul]
+                    parts.append(h_self_L0 + self.self_net(
+                        torch.cat([h_self_L0, aggr_L0], dim=-1)))
+                else:
+                    parts.append(h_out[:, :self.vec_offset])
+
+                # L>0: per-channel sigmoid gate from norm-invariants.
+                if self.gate_net is not None:
+                    # Extract L>0 norms only (rotation-invariant)
+                    high_norms_self, high_norms_aggr = [], []
+                    if self.vec_mul > 0:
+                        h_L1_s = node_feat[:, self.vec_offset:self.tens_offset]
+                        h_L1_a = aggr[:, self.vec_offset:self.tens_offset]
+                        high_norms_self.append(
+                            h_L1_s.reshape(N, self.vec_mul, 3).norm(dim=-1))
+                        high_norms_aggr.append(
+                            h_L1_a.reshape(N, self.vec_mul, 3).norm(dim=-1))
+                    if self.tens_mul > 0:
+                        h_L2_s = node_feat[:, self.tens_offset:]
+                        h_L2_a = aggr[:, self.tens_offset:]
+                        high_norms_self.append(
+                            h_L2_s.reshape(N, self.tens_mul, 5).norm(dim=-1))
+                        high_norms_aggr.append(
+                            h_L2_a.reshape(N, self.tens_mul, 5).norm(dim=-1))
+                    gate = self.gate_net(torch.cat(
+                        high_norms_self + high_norms_aggr, dim=-1))   # [N, high_dim]
+
+                    off = 0
+                    if self.vec_mul > 0:
+                        g = torch.sigmoid(gate[:, off:off + self.vec_mul])
+                        g = g.unsqueeze(-1).expand(-1, -1, 3).reshape(N, self.vec_mul * 3)
+                        parts.append(h_out[:, self.vec_offset:self.tens_offset] * g)
+                        off += self.vec_mul
+                    if self.tens_mul > 0:
+                        g = torch.sigmoid(gate[:, off:off + self.tens_mul])
+                        g = g.unsqueeze(-1).expand(-1, -1, 5).reshape(N, self.tens_mul * 5)
+                        parts.append(h_out[:, self.tens_offset:] * g)
+                else:
+                    # No L>0 channels (pure L=0 model) — nothing to gate
+                    pass
+
+                h_out = torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
 
             return h_out
 
