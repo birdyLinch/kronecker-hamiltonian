@@ -231,28 +231,20 @@ def main():
         label='KronHamModel (no e3nn, +Kronecker)',
     )
 
-    # L_max ablation: 0 → 0+1 → 0+1+2
-    # For isotropic Coulomb energy, adding higher-L channels should NOT help.
-    # L=0 only serves as the sanity-check baseline (should match pure PyTorch scalar model).
-    e3nn_cfgs = [
-        ('16x0e',            2, 'L=0 only  (sanity check)'),
-        ('16x0e + 4x1o',     2, 'L=0+1'),
-        ('16x0e + 4x1o + 2x2e', 2, 'L=0+1+2'),
-    ]
-
+    # e3nn sanity check — L=0 only.
+    # Goal: match KronHamModel (pure PyTorch scalar) with same information.
+    # Once these two converge, we can add L>0 channels with confidence.
     if HAS_E3NN_COULOMB:
-        for irreps_str, lmax, tag in e3nn_cfgs:
-            key = f'KronHamModelE3NN ({tag})'
-            m = KronHamModelE3NN(
-                hidden=64,
-                node_irreps=irreps_str,
-                edge_sh_lmax=lmax, n_layers=3,
-                cutoff=CUTOFF, **kron_cfg,
-            ).to(device)
-            results[key] = run(
-                m, train_data, test_data, norm, N_EPOCHS, LR, device,
-                label=f'KronHamModelE3NN ({tag})',
-            )
+        m3 = KronHamModelE3NN(
+            hidden=64,
+            node_irreps='16x0e',   # L=0 only — pure scalars, no directional channels
+            edge_sh_lmax=2, n_layers=3,
+            cutoff=CUTOFF, **kron_cfg,
+        ).to(device)
+        results['KronHamModelE3NN (L=0 only)'] = run(
+            m3, train_data, test_data, norm, N_EPOCHS, LR, device,
+            label='KronHamModelE3NN (L=0 only)',
+        )
     else:
         print("\n[skip] e3nn not installed — KronHamModelE3NN not tested")
 
@@ -277,32 +269,18 @@ def main():
         print("✓ Kronecker spectral coupling captures long-range E_AB")
 
     # Sanity check: L=0-only e3nn vs pure PyTorch scalar
-    mae_l0  = results.get('KronHamModelE3NN (L=0 only  (sanity check))', None)
-    mae_l01 = results.get('KronHamModelE3NN (L=0+1)', None)
-    mae_l012= results.get('KronHamModelE3NN (L=0+1+2)', None)
-
+    # Goal: same information → should give similar MAE.
+    # Gap reveals architectural differences between FlexEquivMP and ScalarMPNN.
+    mae_l0 = results.get('KronHamModelE3NN (L=0 only)', None)
     if mae_l0 is not None and mae_kron is not None:
         ratio = mae_kron / mae_l0
         print(f"\n── Sanity check: L=0-only e3nn vs pure PyTorch ──")
+        print(f"  KronHamModel (scalar):   {mae_kron:.4f}")
+        print(f"  KronHamModelE3NN (L=0):  {mae_l0:.4f}   ratio = {ratio:.2f}x")
         if 0.7 < ratio < 1.3:
-            print(f"✓ L=0-only e3nn ≈ pure PyTorch  ({ratio:.2f}x)  "
-                  f"(same info, different backbone → expected similar MAE)")
+            print(f"  ✓ Backbones matched — safe to add L>0 channels")
         else:
-            print(f"⚠ L=0-only e3nn differs from pure PyTorch ({ratio:.2f}x)  "
-                  f"(same scalar info → investigate architecture difference)")
-
-    # L_max ablation: does adding L=1 and L=2 help?
-    if mae_l0 is not None and mae_l01 is not None and mae_l012 is not None:
-        print(f"\n── L_max ablation (Coulomb is isotropic → expect flat or degraded) ──")
-        print(f"  L=0 only : {mae_l0:.4f}")
-        print(f"  L=0+1    : {mae_l01:.4f}   Δ = {mae_l01 - mae_l0:+.4f}")
-        print(f"  L=0+1+2  : {mae_l012:.4f}   Δ = {mae_l012 - mae_l0:+.4f}")
-        if mae_l012 < mae_l0 * 0.85:
-            print("  → Higher-L channels DO help  (unexpected for isotropic task)")
-        elif mae_l0 < mae_l012 * 0.85:
-            print("  → Higher-L channels HURT  (overhead > benefit for scalar task) ✓ expected")
-        else:
-            print("  → Higher-L channels make little difference  (equivariance not decisive) ✓ expected")
+            print(f"  ⚠ Gap remains — diagnose before adding L>0 channels")
 
 
 if __name__ == '__main__':

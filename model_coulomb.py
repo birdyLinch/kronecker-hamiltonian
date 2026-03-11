@@ -247,7 +247,7 @@ class KronHamCore(nn.Module):
         basis_dim: int   = 4,
         K:         int   = 4,
         k_states:  int   = 8,
-        perturb:   float = 1e-6,
+        perturb:   float = 1e-3,   # was 1e-6 — too small relative to natural gap ~0.05
     ):
         super().__init__()
         self.basis_dim = basis_dim
@@ -272,6 +272,10 @@ class KronHamCore(nn.Module):
         # Spectral feature → energy MLP
         # Features: k_states global evals + k_states A evals + k_states B evals + 4 cross stats
         feat_dim = 3 * k_states + 4
+        # Bug fix: eigenvalue scale drifts wildly during training (can span −50…+50
+        # depending on backbone output scale). Without LayerNorm, energy_mlp sees a
+        # completely different input distribution each step → causes training instability.
+        self.eval_norm  = nn.LayerNorm(feat_dim)
         self.energy_mlp = nn.Sequential(
             nn.Linear(feat_dim, 128), nn.SiLU(),
             nn.Linear(128, 64),      nn.SiLU(),
@@ -311,7 +315,11 @@ class KronHamCore(nn.Module):
 
         # Cross-spectrum statistics (capture A-B spectral interaction)
         gap = evals_A[:k].unsqueeze(1) - evals_B[:k].unsqueeze(0)  # [k, k]
-        cross = torch.stack([gap.min(), gap.max(), gap.abs().mean(), gap.std()])
+        # Bug fix: gap.std() has gradient ∂std/∂x_i = (x_i−mean)/(n·std).
+        # When eigenvalues are degenerate (std→0, e.g. during plateau phase),
+        # this becomes 0/0 = NaN. Clamp variance before sqrt to stay finite.
+        gap_std = (gap.var() + 1e-8).sqrt()
+        cross = torch.stack([gap.min(), gap.max(), gap.abs().mean(), gap_std])
 
         return torch.cat([feat_g, feat_A, feat_B, cross])   # [3k+4]
 
@@ -336,7 +344,7 @@ class KronHamCore(nn.Module):
         evals_B = torch.linalg.eigvalsh(H_B)    # [dim_B], sorted ↑
 
         feat    = self._spectral_features(evals_A, evals_B)
-        E_kron  = self.energy_mlp(feat).squeeze()
+        E_kron  = self.energy_mlp(self.eval_norm(feat)).squeeze()
 
         return {'E_kron': E_kron, 'H_A': H_A, 'H_B': H_B,
                 'evals_A': evals_A, 'evals_B': evals_B}
