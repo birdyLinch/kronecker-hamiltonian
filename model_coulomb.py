@@ -91,12 +91,28 @@ def generate_sample(
     ])
 
     energies = compute_coulomb_energies(pos, charges, n_A)
+
+    # Optional global dense quadratic energy (for DenseHam ablation task).
+    # This term depends on all atoms jointly via a fixed random symmetric
+    # matrix Q whose entries do not factorise over A/B.
+    #
+    # E_dense_target = charges^T Q charges
+    #
+    # We construct Q deterministically from (n_A, n_B) so all samples in
+    # the same experiment share the same global coupling.
+    n_tot = n_A + n_B
+    rng_Q = torch.Generator()
+    rng_Q.manual_seed(1234 + 17 * n_A + 31 * n_B)
+    Q = torch.randn(n_tot, n_tot, generator=rng_Q)
+    Q = 0.5 * (Q + Q.t())  # symmetrise
+    E_dense_target = charges @ (Q @ charges)
     return {
         'pos':           pos,
         'charges':       charges,
         'subsystem_ids': subsystem_ids,
         'n_A':           n_A,
         'n_B':           n_B,
+        'E_dense_target': E_dense_target,
         **energies,
     }
 
@@ -354,6 +370,99 @@ class KronHamCore(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
+# DenseHamCore — ablation: no Kronecker structure
+# ══════════════════════════════════════════════════════════════
+
+class DenseHamCore(nn.Module):
+    """
+    Ablation core: build a single dense Hamiltonian H_full over all atoms, without
+    enforcing any Kronecker structure or A/B factorisation.
+
+    Given node features [N, hidden], we build:
+
+      H_full = diag(d) + Σ_k outer(v_k, v_k)   where dim = N * basis_dim
+
+    then diagonalise H_full directly and feed spectral features into an MLP.
+
+    This is strictly more expressive than KronHamCore on small systems, but scales
+    as O((N · basis_dim)³) instead of O((N_A · basis_dim)³ + (N_B · basis_dim)³).
+    It serves as a sanity check that the Kronecker bias is not losing much on the
+    toy Coulomb benchmark.
+    """
+
+    def __init__(
+        self,
+        hidden:    int   = 64,
+        basis_dim: int   = 4,
+        K:         int   = 4,
+        k_states:  int   = 8,
+        perturb:   float = 1e-6,
+    ):
+        super().__init__()
+        self.basis_dim = basis_dim
+        self.K         = K
+        self.k_states  = k_states
+        self.perturb   = perturb
+
+        # K low-rank vector heads shared across all atoms
+        self.vec_heads = nn.ModuleList([nn.Linear(hidden, basis_dim) for _ in range(K)])
+
+        # Diagonal (onsite) head
+        self.diag_head = nn.Sequential(
+            nn.Linear(hidden, hidden // 2), nn.SiLU(),
+            nn.Linear(hidden // 2, basis_dim),
+        )
+
+        # Global spectral features: k smallest + k largest eigenvalues + 4 stats
+        feat_dim = 2 * k_states + 4
+        self.energy_mlp = nn.Sequential(
+            nn.Linear(feat_dim, 128), nn.SiLU(),
+            nn.Linear(128, 64),       nn.SiLU(),
+            nn.Linear(64, 1),
+        )
+
+    def _build_H(self, feat: Tensor) -> Tensor:
+        """feat: [N, hidden] → H_full [dim, dim], dim = N * basis_dim."""
+        d = self.diag_head(feat).reshape(-1)   # [N * basis_dim]
+        H = torch.diag(d)
+        for head in self.vec_heads:
+            v = head(feat).reshape(-1)        # [N * basis_dim]
+            H = H + torch.outer(v, v)
+        return (H + H.T) / 2
+
+    def _spectral_features(self, evals: Tensor) -> Tensor:
+        """Take smallest k and largest k eigenvalues + simple statistics."""
+        k = self.k_states
+        evals_sorted = evals.sort().values
+        n = evals_sorted.shape[0]
+        if n >= k:
+            head = evals_sorted[:k]
+            tail = evals_sorted[-k:]
+        else:
+            head = F.pad(evals_sorted, (0, k - n))
+            tail = head.clone()
+        stats = torch.stack([
+            evals_sorted.min(),
+            evals_sorted.max(),
+            evals_sorted.mean(),
+            evals_sorted.std().clamp(min=1e-8),
+        ])
+        return torch.cat([head, tail, stats])
+
+    def forward(self, node_feat: Tensor) -> Dict[str, Tensor]:
+        # node_feat: [N, hidden]
+        H = self._build_H(node_feat)
+        if self.training and self.perturb > 0:
+            I = torch.eye(H.shape[0], device=H.device, dtype=H.dtype)
+            H = H + self.perturb * I
+
+        evals = torch.linalg.eigvalsh(H)   # [dim], sorted
+        feat  = self._spectral_features(evals)
+        E     = self.energy_mlp(feat).squeeze()
+        return {'E_dense': E, 'H_full': H, 'evals_full': evals}
+
+
+# ══════════════════════════════════════════════════════════════
 # LocalGNN — baseline (provably blind to long-range E_AB)
 # ══════════════════════════════════════════════════════════════
 
@@ -439,6 +548,52 @@ class KronHamModel(nn.Module):
             'energy':  E_local + E_kron,
             'E_local': E_local,
             **kron,
+        }
+
+
+class DenseHamModel(nn.Module):
+    """
+    Ablation model: same ScalarMPNN backbone and local energy head as KronHamModel,
+    but with a single dense Hamiltonian head (DenseHamCore) instead of a Kronecker
+    structured core.
+
+    E_total = E_local + E_dense
+    """
+
+    def __init__(
+        self,
+        hidden:    int   = 64,
+        n_rbf:     int   = 20,
+        cutoff:    float = 4.0,
+        n_layers:  int   = 3,
+        basis_dim: int   = 4,
+        K:         int   = 4,
+        k_states:  int   = 8,
+    ):
+        super().__init__()
+        self.backbone    = ScalarMPNN(hidden, n_rbf, cutoff, n_layers)
+        self.local_head  = nn.Sequential(
+            nn.Linear(hidden, hidden // 2), nn.SiLU(),
+            nn.Linear(hidden // 2, 1),
+        )
+        self.dense_core  = DenseHamCore(hidden, basis_dim, K, k_states)
+
+    def forward(
+        self,
+        charges:       Tensor,   # [N]
+        pos:           Tensor,   # [N, 3]
+        subsystem_ids: Tensor,   # [N]  (unused, kept for API parity)
+    ) -> Dict[str, Tensor]:
+        h = self.backbone(charges, pos)
+
+        E_local = self.local_head(h).sum()
+        dense   = self.dense_core(h)
+        E_dense = dense['E_dense']
+
+        return {
+            'energy':  E_local + E_dense,
+            'E_local': E_local,
+            **dense,
         }
 
 

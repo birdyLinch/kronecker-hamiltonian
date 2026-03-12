@@ -37,13 +37,15 @@ from model_coulomb import (
     generate_dataset,
     LocalGNN,
     KronHamModel,
+    DenseHamModel,
     HAS_E3NN_COULOMB,
 )
 
 if HAS_E3NN_COULOMB:
     from model_coulomb import KronHamModelE3NN
 
-ALL_MODELS = ['local', 'scalar', 'e3nn-none', 'e3nn-nequip', 'e3nn-scalarmix', 'e3nn-64', 'e3nn-scalarmpnn',
+ALL_MODELS = ['local', 'scalar', 'dense',
+              'e3nn-none', 'e3nn-nequip', 'e3nn-scalarmix', 'e3nn-64', 'e3nn-scalarmpnn',
               'e3nn-sigmoid-only', 'e3nn-mlpupdate-only',
               'e3nn-normsage', 'e3nn-normsage-mixed']
 
@@ -86,7 +88,8 @@ def train_epoch(model, dataset, optimiser, norm: Normaliser, device, ema_model=N
             pred   = model(s['charges'].to(device),
                            s['pos'].to(device),
                            s['subsystem_ids'].to(device))['energy']
-            target = torch.tensor(norm.encode(s['E_total'].item()),
+            target_val = s['E_target'].item()
+            target = torch.tensor(norm.encode(target_val),
                                   dtype=torch.float32, device=device)
             # Huber loss (δ=0.1 in normalised space ≈ 0.21 eV original):
             #   quadratic for |err| < δ  → smooth gradient near zero, no plateau
@@ -111,7 +114,8 @@ def evaluate(model, dataset, norm: Normaliser, device):
         pred = model(s['charges'].to(device),
                      s['pos'].to(device),
                      s['subsystem_ids'].to(device))['energy'].item()
-        errs.append(abs(norm.decode(pred) - s['E_total'].item()))
+        true = s['E_target'].item()
+        errs.append(abs(norm.decode(pred) - true))
     return float(np.mean(errs))
 
 
@@ -196,6 +200,11 @@ def main():
         metavar='MODEL',
         help=(f'models to run (default: all). choices: {ALL_MODELS}'),
     )
+    parser.add_argument(
+        '--task', type=str, default='coulomb',
+        choices=['coulomb', 'dense'],
+        help='target energy: "coulomb" = E_total, "dense" = global quadratic E_dense_target',
+    )
     parser.add_argument('--epochs', type=int, default=100, help='training epochs (default: 100)')
     parser.add_argument('--lr',     type=float, default=3e-3, help='learning rate (default: 3e-3)')
     args = parser.parse_args()
@@ -227,12 +236,25 @@ def main():
     train_data = generate_dataset(1000, N_A, N_B, SEPARATION, CLUSTER_STD, CHARGE_SCALE, seed=0)
     test_data  = generate_dataset(200,  N_A, N_B, SEPARATION, CLUSTER_STD, CHARGE_SCALE, seed=1000)
 
-    e_totals = [s['E_total'].item() for s in train_data]
-    e_abs    = [s['E_AB'].item()    for s in train_data]
-    norm     = Normaliser(e_totals)
+    # Select which target to train on.
+    if args.task == 'coulomb':
+        for s in train_data:
+            s['E_target'] = s['E_total']
+        for s in test_data:
+            s['E_target'] = s['E_total']
+        e_targets = [s['E_total'].item() for s in train_data]
+    else:  # 'dense'
+        for s in train_data:
+            s['E_target'] = s['E_dense_target']
+        for s in test_data:
+            s['E_target'] = s['E_dense_target']
+        e_targets = [s['E_dense_target'].item() for s in train_data]
+
+    e_abs = [s['E_AB'].item() for s in train_data]
+    norm  = Normaliser(e_targets)
 
     print(f"\nDataset statistics (train, N={len(train_data)}):")
-    print(f"  E_total : std = {np.std(e_totals):.3f}")
+    print(f"  E_target: std = {np.std(e_targets):.3f}")
     print(f"  E_AB    : std = {np.std(e_abs):.3f}  ← LocalGNN irreducible error floor")
 
     # ── shared configs ───────────────────────────────────────
@@ -250,6 +272,10 @@ def main():
         'scalar': (
             'KronHamModel (no e3nn, +Kronecker)',
             lambda: KronHamModel(**scalar_cfg, **kron_cfg).to(device),
+        ),
+        'dense': (
+            'DenseHamModel (no e3nn, dense spectral head, no Kronecker)',
+            lambda: DenseHamModel(**scalar_cfg, **kron_cfg).to(device),
         ),
         'e3nn-none': (
             'KronHamModelE3NN (16x0e, uvw, linear)',

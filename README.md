@@ -191,6 +191,7 @@ blindly from intra-cluster structure alone, which is impossible.
 |-------|----------|-----------|-------|
 | `LocalGNN` | ScalarMPNN | ✗ | Baseline — atom energy sum, no A–B coupling |
 | `KronHamModel` | ScalarMPNN | ✓ | Scalar features, Kronecker spectral head |
+| `DenseHamModel` | ScalarMPNN | ✗ | Ablation — single dense H over all atoms, no A/B factorisation |
 | `KronHamModelE3NN` | FlexEquivMP (e3nn) | ✓ | Equivariant backbone, currently L=0 only |
 
 ### Results  (100 epochs · 1000 training samples · Huber loss δ=0.1)
@@ -207,6 +208,25 @@ std(E_AB, test) = 0.1803   ←  irreducible error floor for any model that canno
 
 KronHamModel is **4× better** than LocalGNN and breaks well below the `std(E_AB)` floor,
 confirming it genuinely predicts the long-range term.
+
+#### KronHam vs DenseHam ablation
+
+To check that the Kronecker inductive bias is not losing too much, we compare against
+**DenseHamModel**: same ScalarMPNN backbone but a single dense Hamiltonian over all atoms
+(no A/B factorisation), with spectrum → MLP. On the Coulomb task (`--task coulomb`):
+
+| Model | Params | Test MAE (typical) | Note |
+|-------|--------|-------------------|------|
+| KronHamModel | 74,666 | ~0.08 | Structured, scalable |
+| DenseHamModel | 70,390 | **~0.045** | More expressive head, same data |
+
+DenseHam can do slightly better on this toy because the dense spectral head is more
+flexible; KronHam trades a bit of accuracy for physical interpretability (A/B spectra)
+and O(d_A³ + d_B³) scaling. Both beat the LocalGNN floor by a large margin.
+
+**Tasks:** `train_coulomb.py --task coulomb` (default) uses E_total; `--task dense` uses
+a global quadratic E_dense_target = q^T Q q (fixed random Q) for ablation when the
+target does not factorise over A/B.
 
 ### Why Kronecker works: spectral encoding of E_AB
 
@@ -595,13 +615,15 @@ to_hidden` projection before KronHamCore) should not affect trainability.
 
 ```bash
 python train_coulomb.py                                    # all models (full comparison)
+python train_coulomb.py --task coulomb --models scalar dense   # KronHam vs DenseHam ablation
+python train_coulomb.py --task dense --models scalar dense     # non-Kronecker target (E_dense_target)
 python train_coulomb.py --models e3nn-64                   # just the 64x0e variant
 python train_coulomb.py --models scalar e3nn-64            # compare scalar vs best e3nn
-python train_coulomb.py --models scalar e3nn-scalarmpnn    # equivalence test ← new
+python train_coulomb.py --models scalar e3nn-scalarmpnn    # equivalence test
 python train_coulomb.py --models e3nn-64 --epochs 200      # longer run
 ```
 
-Available model keys: `local`, `scalar`, `e3nn-none`, `e3nn-nequip`, `e3nn-scalarmix`, `e3nn-64`, `e3nn-scalarmpnn`
+Available model keys: `local`, `scalar`, `dense`, `e3nn-none`, `e3nn-nequip`, `e3nn-scalarmix`, `e3nn-64`, `e3nn-scalarmpnn`, `e3nn-sigmoid-only`, `e3nn-mlpupdate-only`, `e3nn-normsage`, `e3nn-normsage-mixed`
 
 ## 文件结构
 
@@ -609,10 +631,10 @@ Available model keys: `local`, `scalar`, `e3nn-none`, `e3nn-nequip`, `e3nn-scala
 kronecker_hamiltonian/
 ├── model.py            # 完整模型（5个部分，e3nn 等变骨干）
 ├── model_v2.py         # 模型 v2（早期 e3nn 版本，已弃用）
-├── model_coulomb.py    # Coulomb 实验模型（LocalGNN / KronHamModel / KronHamModelE3NN）
+├── model_coulomb.py    # Coulomb 实验模型（LocalGNN / KronHamModel / DenseHamModel / KronHamModelE3NN）
 │                       #   · ScalarMPNN: GaussianRBF(20) + cosine envelope 距离编码
+│                       #   · KronHamCore: H_A,H_B = diag+Σ v_k⊗v_k^T，Kronecker 谱；DenseHamCore: 单一大 H
 │                       #   · FlexEquivMP: e3nn TP，相同 RBF 权重生成
-│                       #   · KronHamCore: H=diag+Σ v_k⊗v_k^T，3k+4 谱特征
 ├── train.py            # 训练脚本 + 使用示例
 ├── train_coulomb.py    # 长程交互对比实验（含 Huber 损失 / 分组 AdamW / warmup）
 ├── test_kronecker.py   # 测试套件（8项测试）
