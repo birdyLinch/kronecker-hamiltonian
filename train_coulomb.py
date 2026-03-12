@@ -38,13 +38,14 @@ from model_coulomb import (
     LocalGNN,
     KronHamModel,
     DenseHamModel,
+    FractalKronHamModel,
     HAS_E3NN_COULOMB,
 )
 
 if HAS_E3NN_COULOMB:
     from model_coulomb import KronHamModelE3NN
 
-ALL_MODELS = ['local', 'scalar', 'dense',
+ALL_MODELS = ['local', 'scalar', 'dense', 'fractal', 'fractal-4ch',
               'e3nn-none', 'e3nn-nequip', 'e3nn-scalarmix', 'e3nn-64', 'e3nn-scalarmpnn',
               'e3nn-sigmoid-only', 'e3nn-mlpupdate-only',
               'e3nn-normsage', 'e3nn-normsage-mixed']
@@ -215,7 +216,10 @@ def main():
         parser.error(f"unknown model(s): {unknown}. choices: {ALL_MODELS}")
 
     torch.manual_seed(42)
-    device = 'cpu'
+    # MPS skipped: torch.linalg.eigvalsh is not implemented on MPS.
+    # With eigvalsh in every forward pass, data would ping-pong between
+    # MPS and CPU on each step — slower than pure CPU.
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # ── dataset ─────────────────────────────────────────────
     N_A, N_B     = 5, 5
@@ -275,7 +279,34 @@ def main():
         ),
         'dense': (
             'DenseHamModel (no e3nn, dense spectral head, no Kronecker)',
-            lambda: DenseHamModel(**scalar_cfg, **kron_cfg).to(device),
+            # K=2*K_kron=8: KronHam has K vec heads per subsystem (2K total);
+            # Dense uses shared heads over all atoms, so needs 2K to match rank.
+            lambda: DenseHamModel(**scalar_cfg,
+                                  basis_dim=kron_cfg['basis_dim'],
+                                  K=kron_cfg['K'] * 2,
+                                  k_states=kron_cfg['k_states']).to(device),
+        ),
+        'fractal': (
+            'FractalKronHamModel (N_ch=2, K=4, basis_dim=2)',
+            # basis_dim halved: each channel sees all N atoms (not N/2), so
+            # dim_ch = N * (basis_dim/2) = 10*2 = 20, matching KronHam's subsystem dim.
+            # Global evals = 20² = 400 — identical to KronHam.
+            lambda: FractalKronHamModel(**scalar_cfg,
+                                        basis_dim=kron_cfg['basis_dim'] // 2,
+                                        K=kron_cfg['K'],
+                                        k_states=kron_cfg['k_states'],
+                                        N_ch=2).to(device),
+        ),
+        'fractal-4ch': (
+            'FractalKronHamModel (N_ch=4, K=4, basis_dim=1)',
+            # basis_dim // N_ch = 4//4 = 1  →  dim_ch = N * 1 = 10×10 per channel.
+            # Total basis N*basis_dim=40 split equally: each channel gets 10 dims.
+            # Global evals = 10⁴ = 10,000 (before truncation to d*k=80).
+            lambda: FractalKronHamModel(**scalar_cfg,
+                                        basis_dim=kron_cfg['basis_dim'] // 4,
+                                        K=kron_cfg['K'],
+                                        k_states=kron_cfg['k_states'],
+                                        N_ch=4).to(device),
         ),
         'e3nn-none': (
             'KronHamModelE3NN (16x0e, uvw, linear)',

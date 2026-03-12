@@ -625,6 +625,187 @@ python train_coulomb.py --models e3nn-64 --epochs 200      # longer run
 
 Available model keys: `local`, `scalar`, `dense`, `e3nn-none`, `e3nn-nequip`, `e3nn-scalarmix`, `e3nn-64`, `e3nn-scalarmpnn`, `e3nn-sigmoid-only`, `e3nn-mlpupdate-only`, `e3nn-normsage`, `e3nn-normsage-mixed`
 
+---
+
+## 架构设计备忘：下次重新思考这个 idea 时的出发点
+
+> 以下是从第一性原理重新推导这个设计空间时积累的核心认识，留存备用。
+
+### 1. 为什么用 Kronecker sum，而不是 Kronecker product？
+
+**Kronecker sum：** `H_AB = H_A ⊗ I_B + I_A ⊗ H_B`
+→ 特征值为 `ε_ij = ε_i^A + ε_j^B`（能量相加）
+
+**Kronecker product：** `H_AB = H_A ⊗ H_B`
+→ 特征值为 `ε_ij = ε_i^A × ε_j^B`（能量相乘，无物理意义）
+
+Kronecker sum 对应**非相互作用子系统**的能级叠加，是非周期体系长程相互作用的自然数学结构。
+
+---
+
+### 2. 旋转等变性如何传递？
+
+对整个体系做旋转 R：
+```
+H_A  →  U_A H_A U_A†     （U_A = 轨道角动量对应的 Wigner D 矩阵）
+H_B  →  U_B H_B U_B†
+
+H_AB  →  (U_A⊗U_B) H_AB (U_A⊗U_B)†     ← 等变
+特征值 {ε_i^A + ε_j^B}  →  不变          ← 标量能量正确
+```
+
+关键点：
+- 当前 ScalarMPNN 产生旋转不变的节点特征 → H_A, H_B 本身即不变 → 平凡满足
+- 若使用高角动量基（p, d 轨道）：H 等变，但**特征值仍是标量不变量** → Kronecker 结构天然兼容等变性
+- 只要整体系统统一旋转（U_A 和 U_B 是同一个 R），Kronecker 积空间 U_A⊗U_B 就对应一个合法的全局旋转
+
+---
+
+### 3. H 的自然因子分解：不应按 A/B 原子组分割
+
+**dim(H) = N_atom × N_basis**，对应两个自然张量积模式：
+
+```
+H (N×d × N×d)  =  H_atom (N×N) ⊗ I_d  +  I_N ⊗ H_basis (d×d)
+```
+
+| 因子 | 大小 | 物理意义 | 随体系变化？ |
+|---|---|---|---|
+| H_atom | N×N | 原子间跳跃（tight-binding） | 是，随 N_atom 变 |
+| H_basis | d×d | 单原子轨道间混合 | 否，固定大小 |
+
+**关键约束：** 因为 N_atom 随输入变化，Kronecker 分解中**必须有且只有一个因子包含 N_atom**。
+另一个因子必须是 N-无关的。这天然给出了上面的 atom × basis 分解。
+
+**对比当前的 A/B 原子组分割：**
+```
+A/B split (N_A=3, N_B=3, basis_dim=8):
+  H_A: (N_A×d)² = 24×24     H_B: (N_B×d)² = 24×24
+  Kronecker sum → 24×24 = 576 个特征值  ← 远超原始 H 的 48 个
+
+atom×basis split:
+  H_atom: N×N = 6×6          H_basis: d×d = 8×8
+  Kronecker sum → 6×8 = 48 个特征值    ← 恰好等于原始 H 的维度
+```
+
+atom×basis 分解更自然：特征值数量与原始 H 一致，且有明确物理解释（Hückel/tight-binding 结构）。
+
+---
+
+### 4. 计算复杂度：如何逼近 O(N^(3/2))？
+
+**固定 N_ch=2（当前实现）：**
+```
+两个 eigvalsh on (N/2)×(N/2):  O(N³/4)  ← 仍是 O(N³)，只省了常数 4
+```
+
+**N_ch 随 N 缩放时（一般情形）：**
+```
+总 eigvalsh 代价 = N_ch × (N/N_ch × d)³ = N³d³ / N_ch²
+
+令 N_ch = N^α：代价 = O(N^(3-2α) × d³)
+
+α = 3/4  →  代价 = O(N^(3/2) × d³)   ← 最优折衷点
+         →  每个子系统含 N^(1/4) 个原子
+```
+
+| N_ch | 代价 | 备注 |
+|---|---|---|
+| 1 | O(N³d³) | 暴力对角化 |
+| 2 | O(N³d³/4) | 当前实现，常数改善 |
+| N^(3/4) | **O(N^(3/2)d³)** | ← 最优 |
+| N | O(Nd³) | 每通道只有 1 个原子，但全局谱指数爆炸 |
+
+注意：N_ch 增大后，Kronecker 外积和的特征值数量以 (N/N_ch)^N_ch 指数增长，需要逐步截断（保留最低 k 个）才能控制代价。
+
+---
+
+### 5. secular equation：真正绕过 O(N³) 的工具
+
+对 `H = D + V^T V`（rank-K + 对角，dim = M）：
+
+特征值满足 secular equation：
+```
+det( I_K + V (D - λI)^{-1} V^T ) = 0    ← K×K 行列式
+```
+
+复杂度分析：
+
+| | eigvalsh | secular equation |
+|---|---|---|
+| **时间** | O(M³) | **O(K² M²)** |
+| **空间** | O(M²) | **O(KM)**（无需存 H） |
+
+对比 Kronecker + secular on H_atom vs 直接 secular on H_full：
+
+| 方法 | dim | 时间 | 空间 |
+|---|---|---|---|
+| secular on H_full | N×d | O(K²N²d²) | O(KNd) |
+| Kronecker + secular on H_atom | N | O(K²N²) + O(d³) | O(KN+d²) |
+| Kronecker 节省 | — | **d² 倍** | **d 倍** |
+
+---
+
+### 6. 对于小系统：最简洁的方案
+
+对于当前 toy problem（N=10, d=4, dim=40）：
+
+```
+直接 secular equation on H_full:
+  dim = 40
+  O(K² × 40²) = O(K² × 1600)  ← 极快，无需任何 Kronecker 分解
+```
+
+**Kronecker 是 premature optimization**——它的价值只在 N 和 d 都大时才体现。
+当前 A/B 分割的最大问题不是效率，而是：
+1. 需要手动指定哪些原子属于 A，哪些属于 B
+2. A/B 分割本身是一个强 inductive bias，对 general 体系不适用
+3. 强制 additive 特征值结构 ε_i^A + ε_j^B，可能损失表达力
+
+---
+
+### 7. 更好的替代：软分组（无 A/B 标签）
+
+比硬 A/B 分割更优雅的方向是**让模型自己学习原子分组**：
+
+```python
+S = softmax(Attention(node_feat))    # [N, N_ch]，软分组权重（学出来）
+for c in range(N_ch):
+    feat_c = S[:, c].unsqueeze(1) * node_feat   # 按权重加权
+    H_c    = diag(d_c) + V_c^T V_c              # 该通道的 H
+# Kronecker sum of H_0, ..., H_{N_ch-1}
+```
+
+优点：
+- 无需 `subsystem_ids`，适用任意体系
+- 在当前 toy 问题（5A+5B 分开）上，模型有望**自发发现**两个簇的分组结构
+- 保留 Kronecker sum 的物理意义（非相互作用子系统的能级叠加）
+
+这是 `FractalKronHamModel` 思路的自然延伸，但用注意力代替了固定的均匀通道分配。
+
+---
+
+### 8. FractalKronHamModel（已实现，待验证）
+
+当前实现了一个去掉 A/B 标签的变体：N_ch 个独立通道，每个通道作用于全部 N 个原子，全局谱通过递归 Kronecker sum（外积和）得到。
+
+**正确的参数设置：**
+```
+总 basis = N_atom × basis_dim（固定）
+每通道 basis_dim = basis_dim_total // N_ch   ← 均匀分配，dim_ch 与 KronHam 对齐
+
+N_ch=2:  basis_dim_ch=2, dim_ch=N×2=20   全局谱 20²=400   ← 与 KronHam 一致
+N_ch=4:  basis_dim_ch=1, dim_ch=N×1=10   全局谱 10⁴=10000
+```
+
+**运行：**
+```bash
+python train_coulomb.py --models scalar fractal fractal-4ch --epochs 100
+```
+
+**已观察到的问题（N_ch=2）：** ep60 收敛快（0.0503 vs KronHam 的 0.0747），但 ep80-100 过拟合
+（train loss=0.0004，test MAE=0.0700）。推测原因：无 A/B 结构先验作为正则化。
+
 ## 文件结构
 
 ```

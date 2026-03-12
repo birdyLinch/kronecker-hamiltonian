@@ -31,6 +31,10 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import Optional, Dict, List
 
+# Module-level cache for the dense quadratic coupling matrix Q.
+# Q is deterministic from (n_A, n_B) — no need to recompute it per sample.
+_Q_CACHE: Dict[tuple, Tensor] = {}
+
 
 # ══════════════════════════════════════════════════════════════
 # Dataset generation
@@ -93,18 +97,15 @@ def generate_sample(
     energies = compute_coulomb_energies(pos, charges, n_A)
 
     # Optional global dense quadratic energy (for DenseHam ablation task).
-    # This term depends on all atoms jointly via a fixed random symmetric
-    # matrix Q whose entries do not factorise over A/B.
-    #
-    # E_dense_target = charges^T Q charges
-    #
-    # We construct Q deterministically from (n_A, n_B) so all samples in
-    # the same experiment share the same global coupling.
+    # Q is deterministic from (n_A, n_B) — cached to avoid recomputing per sample.
     n_tot = n_A + n_B
-    rng_Q = torch.Generator()
-    rng_Q.manual_seed(1234 + 17 * n_A + 31 * n_B)
-    Q = torch.randn(n_tot, n_tot, generator=rng_Q)
-    Q = 0.5 * (Q + Q.t())  # symmetrise
+    key = (n_A, n_B)
+    if key not in _Q_CACHE:
+        rng_Q = torch.Generator()
+        rng_Q.manual_seed(1234 + 17 * n_A + 31 * n_B)
+        Q_raw = torch.randn(n_tot, n_tot, generator=rng_Q)
+        _Q_CACHE[key] = 0.5 * (Q_raw + Q_raw.t())
+    Q = _Q_CACHE[key]
     E_dense_target = charges @ (Q @ charges)
     return {
         'pos':           pos,
@@ -309,11 +310,9 @@ class KronHamCore(nn.Module):
     ) -> Tensor:
         """Build one subsystem Hamiltonian [dim, dim]."""
         d = diag_head(feat).reshape(-1)    # [n_sub * basis_dim]
-        H = torch.diag(d)
-        for head in vec_heads:
-            v = head(feat).reshape(-1)     # [n_sub * basis_dim]
-            H = H + torch.outer(v, v)
-        return (H + H.T) / 2               # enforce symmetry
+        # Stack K rank-1 vectors into [K, dim], then V^T V ≡ Σ_k v_k⊗v_k (one BLAS call).
+        V = torch.stack([head(feat).reshape(-1) for head in vec_heads])  # [K, dim]
+        return torch.diag(d) + V.t() @ V   # symmetric by construction
 
     def _spectral_features(self, evals_A: Tensor, evals_B: Tensor) -> Tensor:
         k = self.k_states
@@ -424,16 +423,14 @@ class DenseHamCore(nn.Module):
     def _build_H(self, feat: Tensor) -> Tensor:
         """feat: [N, hidden] → H_full [dim, dim], dim = N * basis_dim."""
         d = self.diag_head(feat).reshape(-1)   # [N * basis_dim]
-        H = torch.diag(d)
-        for head in self.vec_heads:
-            v = head(feat).reshape(-1)        # [N * basis_dim]
-            H = H + torch.outer(v, v)
-        return (H + H.T) / 2
+        V = torch.stack([head(feat).reshape(-1) for head in self.vec_heads])  # [K, dim]
+        return torch.diag(d) + V.t() @ V      # symmetric by construction
 
     def _spectral_features(self, evals: Tensor) -> Tensor:
         """Take smallest k and largest k eigenvalues + simple statistics."""
         k = self.k_states
-        evals_sorted = evals.sort().values
+        # eigvalsh already returns sorted ascending — no re-sort needed.
+        evals_sorted = evals
         n = evals_sorted.shape[0]
         if n >= k:
             head = evals_sorted[:k]
@@ -598,6 +595,182 @@ class DenseHamModel(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
+# FractalKronHamCore / FractalKronHamModel
+# N_ch independent Hamiltonians over ALL atoms — no A/B split needed
+# ══════════════════════════════════════════════════════════════
+
+class FractalKronHamCore(nn.Module):
+    """
+    N_ch independent Hamiltonians over ALL atoms — no subsystem split required.
+
+    Each channel c builds:
+        H_c = diag(d_c) + V_c^T V_c    (dim = N * basis_dim)
+
+    Global spectrum via recursive Kronecker sum (outer-sum of per-channel eigenvalues):
+        ε_global = { λ_i^0 + λ_j^1 + ... + λ_k^{N_ch-1} }
+
+    This removes the A/B labelling constraint while preserving the Kronecker
+    long-range coupling mechanism.
+
+    Parameter parity with KronHamCore (N_ch=2, K=4):
+        Both have 2*K=8 total vec heads and 2 diag MLPs.
+
+    Feature shape: k*(1+N_ch)+4
+        N_ch=2 → 3k+4=28  ← identical to KronHamCore, direct apples-to-apples comparison.
+        N_ch=4 → 5k+4=44  ← more spectral detail per channel (K reduced to maintain param count).
+    """
+
+    def __init__(
+        self,
+        hidden:    int   = 64,
+        basis_dim: int   = 4,
+        K:         int   = 4,
+        k_states:  int   = 8,
+        N_ch:      int   = 2,
+        perturb:   float = 1e-6,
+    ):
+        super().__init__()
+        self.basis_dim = basis_dim
+        self.K         = K
+        self.k_states  = k_states
+        self.N_ch      = N_ch
+        self.perturb   = perturb
+
+        # N_ch independent sets of K low-rank vector heads (all see every atom)
+        self.vec_heads = nn.ModuleList([
+            nn.ModuleList([nn.Linear(hidden, basis_dim) for _ in range(K)])
+            for _ in range(N_ch)
+        ])
+
+        # N_ch independent diagonal (onsite) heads
+        self.diag_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden, hidden // 2), nn.SiLU(),
+                nn.Linear(hidden // 2, basis_dim),
+            )
+            for _ in range(N_ch)
+        ])
+
+        # Spectral features: k global + k per channel + 4 cross stats (ch0 vs ch1 gap)
+        # NOTE: No LayerNorm on eigenvalues — absolute scale carries physical information.
+        feat_dim = k_states * (1 + N_ch) + 4
+        self.energy_mlp = nn.Sequential(
+            nn.Linear(feat_dim, 128), nn.SiLU(),
+            nn.Linear(128, 64),      nn.SiLU(),
+            nn.Linear(64, 1),
+        )
+
+    def _build_H(
+        self,
+        feat:      Tensor,           # [N, hidden]
+        vec_heads: nn.ModuleList,
+        diag_head: nn.Module,
+    ) -> Tensor:
+        """Build one channel's Hamiltonian [dim, dim], dim = N * basis_dim."""
+        d = diag_head(feat).reshape(-1)                                         # [N * basis_dim]
+        V = torch.stack([head(feat).reshape(-1) for head in vec_heads])         # [K, dim]
+        return torch.diag(d) + V.t() @ V                                        # symmetric
+
+    def _spectral_features(self, ch_evals: list) -> Tensor:
+        k = self.k_states
+
+        # Recursive Kronecker (outer) sum: start with ch0, fold in ch1, ch2, ...
+        # Without truncation the tensor grows as d^N_ch (e.g. 20⁴=160k for N_ch=4).
+        # Truncate after each fold: keep only max_keep = d*k lowest values.
+        # Physically motivated (low-energy sector); sufficient because we only
+        # read k values from the final global_evals.
+        d        = ch_evals[0].shape[0]   # per-channel eigenvalue count (= N * basis_dim)
+        max_keep = d * k                  # e.g. 20*8=160, bounded and independent of N_ch
+        global_evals = ch_evals[0]
+        for c in range(1, self.N_ch):
+            global_evals = (global_evals.unsqueeze(-1) + ch_evals[c].unsqueeze(0)).reshape(-1)
+            global_evals = global_evals.sort().values[:max_keep]
+
+        def pad_or_trim(x: Tensor) -> Tensor:
+            n = x.shape[0]
+            return x[:k] if n >= k else F.pad(x, (0, k - n))
+
+        feat_g   = pad_or_trim(global_evals)
+        ch_feats = [pad_or_trim(e) for e in ch_evals]
+
+        # Cross-spectrum statistics: ch0 vs ch1 spectral gap (same formula as KronHamCore A-B)
+        gap = ch_evals[0][:k].unsqueeze(1) - ch_evals[1][:k].unsqueeze(0)      # [k, k]
+        cross = torch.stack([
+            gap.min(), gap.max(), gap.abs().mean(),
+            gap.std().clamp(min=1e-8),
+        ])
+
+        return torch.cat([feat_g, *ch_feats, cross])   # [k*(1+N_ch)+4]
+
+    def forward(
+        self,
+        node_feat:     Tensor,            # [N, hidden]
+        subsystem_ids: Tensor = None,     # ignored — no subsystem split needed
+    ) -> Dict[str, Tensor]:
+        ch_evals, ch_H = [], []
+        for c in range(self.N_ch):
+            H = self._build_H(node_feat, self.vec_heads[c], self.diag_heads[c])
+            if self.training and self.perturb > 0:
+                H = H + self.perturb * torch.eye(H.shape[0], device=H.device, dtype=H.dtype)
+            evals = torch.linalg.eigvalsh(H)    # sorted ascending
+            ch_evals.append(evals)
+            ch_H.append(H)
+
+        feat   = self._spectral_features(ch_evals)
+        E_frac = self.energy_mlp(feat).squeeze()
+
+        out = {'E_frac': E_frac}
+        out.update({f'H_ch{c}':     ch_H[c]    for c in range(self.N_ch)})
+        out.update({f'evals_ch{c}': ch_evals[c] for c in range(self.N_ch)})
+        return out
+
+
+class FractalKronHamModel(nn.Module):
+    """
+    Full model: E_total = E_local + E_frac
+
+    Uses FractalKronHamCore: N_ch independent Hamiltonians over all atoms.
+    subsystem_ids is accepted for API parity but completely ignored.
+    """
+
+    def __init__(
+        self,
+        hidden:    int   = 64,
+        n_rbf:     int   = 20,
+        cutoff:    float = 4.0,
+        n_layers:  int   = 3,
+        basis_dim: int   = 4,
+        K:         int   = 4,
+        k_states:  int   = 8,
+        N_ch:      int   = 2,
+    ):
+        super().__init__()
+        self.backbone   = ScalarMPNN(hidden, n_rbf, cutoff, n_layers)
+        self.local_head = nn.Sequential(
+            nn.Linear(hidden, hidden // 2), nn.SiLU(),
+            nn.Linear(hidden // 2, 1),
+        )
+        self.frac_core  = FractalKronHamCore(hidden, basis_dim, K, k_states, N_ch)
+
+    def forward(
+        self,
+        charges:       Tensor,   # [N]
+        pos:           Tensor,   # [N, 3]
+        subsystem_ids: Tensor,   # [N]  (ignored — no A/B split)
+    ) -> Dict[str, Tensor]:
+        h       = self.backbone(charges, pos)
+        E_local = self.local_head(h).sum()
+        frac    = self.frac_core(h)
+        E_frac  = frac['E_frac']
+
+        return {
+            'energy':  E_local + E_frac,
+            'E_local': E_local,
+            **frac,
+        }
+
+
+# ══════════════════════════════════════════════════════════════
 # KronHamModelE3NN — e3nn equivariant backbone + KronHamCore
 # (fair comparison: same charge input API as the pure-PyTorch models)
 # ══════════════════════════════════════════════════════════════
@@ -625,7 +798,7 @@ try:
         """
 
         def __init__(self, node_irreps: str, edge_sh_lmax: int = 2,
-                     fc_hidden: list = [32, 32],
+                     fc_hidden: Optional[List[int]] = None,
                      n_rbf: int = 20, cutoff: float = 4.0,
                      self_interaction: str = 'none',
                      tp_mode: str = 'uvw',
@@ -670,6 +843,8 @@ try:
               '64x0e' + 'uvu' + 'scalar_mpnn' + sigmoid    → architecturally ≡ ScalarMPNN ← new
             """
             super().__init__()
+            if fc_hidden is None:
+                fc_hidden = [32, 32]
             self.node_irreps      = Irreps(node_irreps)
             self.self_interaction  = self_interaction
             self.tp_mode           = tp_mode
